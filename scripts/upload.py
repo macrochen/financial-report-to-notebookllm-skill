@@ -20,17 +20,22 @@ venv_bin = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if os.path.exists(venv_bin):
     os.environ["PATH"] = venv_bin + os.pathsep + os.environ.get("PATH", "")
 
+NOTEBOOKLM_BIN = os.path.join(venv_bin, "notebooklm")
 
 def check_notebooklm_installed() -> bool:
     """Check if notebooklm CLI is installed"""
+    if os.path.exists(NOTEBOOKLM_BIN):
+        return True
     return shutil.which("notebooklm") is not None
 
 
 def run_notebooklm_command(args: list) -> tuple:
     """Run notebooklm command and return (success, output)"""
+    cmd = [NOTEBOOKLM_BIN] if os.path.exists(NOTEBOOKLM_BIN) else ["notebooklm"]
+    
     try:
         result = subprocess.run(
-            ["notebooklm"] + args, capture_output=True, text=True, timeout=120
+            cmd + args, capture_output=True, text=True, timeout=120
         )
         return result.returncode == 0, result.stdout + result.stderr
     except Exception as e:

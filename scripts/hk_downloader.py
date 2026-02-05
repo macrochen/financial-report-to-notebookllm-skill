@@ -97,13 +97,13 @@ class HkexDownloader:
                         full_url = "https://www1.hkexnews.hk" + href if href.startswith("/") else href
                         
                         # 简繁兼容过滤
-                        if any(k in title for k in ["年報", "年报", "中期", "年度報告", "年度报告"]):
+                        if any(k in title for k in ["年報", "年报", "中期", "年度報告", "年度报告", "中期業績", "中期业绩"]):
                             if all(k not in title for k in ["摘要", "更正", "補充", "结果", "ESG"]):
                                 if not any(r["url"] == full_url for r in reports):
                                     print(f"  ✅ 捕获: {title}")
                                     reports.append({"title": title, "url": full_url})
                     except: continue
-                    if len(reports) >= 8: break
+                    if len(reports) >= 12: break
 
                 # 方法 B: 源码正则提取 (降级兜底)
                 if not reports:
@@ -130,23 +130,44 @@ class HkexDownloader:
     def download_and_convert(self, reports: list, output_dir: str) -> list:
         results = []
         headers = {"User-Agent": self.user_agent, "Referer": "https://www1.hkexnews.hk/"}
+        
         with httpx.Client(timeout=60.0, headers=headers, follow_redirects=True) as client:
             for r in reports:
-                try:
-                    clean_title = "".join(c for c in r["title"] if c.isalnum() or c in " _-").strip()
-                    filename = f"{clean_title}.pdf"
-                    filepath = os.path.join(output_dir, filename)
-                    print(f"📥 下载: {r['title']}")
-                    resp = client.get(r["url"])
-                    if resp.status_code == 200:
-                        with open(filepath, "wb") as f: f.write(resp.content)
-                        md_path = pdf_to_markdown(filepath)
-                        if md_path:
-                            results.append(md_path)
-                            os.remove(filepath)
-                    time.sleep(1)
-                except Exception as e:
-                    print(f"❌ 失败: {e}")
+                success = False
+                for attempt in range(3):
+                    try:
+                        clean_title = "".join(c for c in r["title"] if c.isalnum() or c in " _-").strip()
+                        filename = f"{clean_title}.pdf"
+                        filepath = os.path.join(output_dir, filename)
+                        
+                        print(f"📥 下载 ({attempt+1}/3): {r['title']}")
+                        resp = client.get(r["url"])
+                        
+                        if resp.status_code == 200:
+                            # 验证是否为真实的 PDF (前 4 字节应为 %PDF)
+                            if resp.content.startswith(b"%PDF"):
+                                with open(filepath, "wb") as f:
+                                    f.write(resp.content)
+                                
+                                md_path = pdf_to_markdown(filepath)
+                                if md_path:
+                                    results.append(md_path)
+                                    os.remove(filepath)
+                                    success = True
+                                    break
+                            else:
+                                print(f"⚠️ 下载内容似乎不是有效的 PDF，重试中...")
+                        else:
+                            print(f"⚠️ 下载失败: HTTP {resp.status_code}")
+                        
+                        time.sleep(2) # 失败重试等待
+                    except Exception as e:
+                        print(f"❌ 失败: {e}")
+                        time.sleep(2)
+                
+                if not success:
+                    print(f"🚫 放弃下载: {r['title']}")
+                time.sleep(1)
         return results
 
 if __name__ == "__main__":
