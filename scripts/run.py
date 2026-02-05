@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+FinancialReport2NotebookLLM - Multi-Market Orchestrator
+Supports A-share, US, and HK markets with Markdown conversion.
+"""
+
+import sys
+import os
+import json
+import tempfile
+import shutil
+import re
+
+# Add scripts directory to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Ensure virtual environment's bin is in PATH
+venv_bin = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".venv", "bin")
+if os.path.exists(venv_bin):
+    os.environ["PATH"] = venv_bin + os.pathsep + os.environ.get("PATH", "")
+
+def detect_market(stock_input: str) -> str:
+    """Detect market based on input string"""
+    # Ticker (US): Letters only
+    if re.match(r"^[A-Za-z]+$", stock_input):
+        return "US"
+    # HK Code: 5 digits (can start with 0)
+    if re.match(r"^\d{5}$", stock_input):
+        return "HK"
+    # A-share Code: 6 digits
+    if re.match(r"^\d{6}$", stock_input):
+        return "CN"
+    # Default to CN name lookup
+    return "CN_NAME"
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python run.py <ticker_or_code_or_name>")
+        sys.exit(1)
+
+    stock_input = sys.argv[1]
+    market = detect_market(stock_input)
+    
+    output_dir = tempfile.mkdtemp(prefix="fin_reports_")
+    all_files = []
+    stock_name = stock_input
+    prompt_file = "financial_analyst_prompt.txt"
+
+    print(f"🔍 Detected Market: {market}")
+
+    if market == "US":
+        from us_downloader import SecEdgarDownloader
+        downloader = SecEdgarDownloader()
+        all_files = downloader.get_reports(stock_input, output_dir)
+        prompt_file = "us_financial_analyst_prompt.txt"
+        stock_name = stock_input.upper()
+    elif market == "HK":
+        from hk_downloader import HkexDownloader
+        downloader = HkexDownloader()
+        reps = downloader.find_reports(stock_input)
+        all_files = downloader.download_and_convert(reps, output_dir)
+        stock_name = f"HK_{stock_input}"
+    else:
+        from download import CnInfoDownloader
+        downloader = CnInfoDownloader()
+        stock_code, stock_info = downloader.find_stock(stock_input)
+        if stock_code:
+            stock_name = stock_info.get("zwjc", stock_code)
+            current_year = 2025 # Simplified for demo
+            annual_years = list(range(current_year - 4, current_year))
+            all_files = downloader.download_annual_reports(stock_code, annual_years, output_dir)
+            periodic = downloader.download_periodic_reports(stock_code, current_year, output_dir)
+            all_files.extend(periodic)
+        else:
+            print(f"❌ Stock not found: {stock_input}")
+            shutil.rmtree(output_dir)
+            sys.exit(1)
+
+    if not all_files:
+        print("❌ No reports downloaded")
+        shutil.rmtree(output_dir)
+        sys.exit(1)
+
+    print(f"\n✅ Processed {len(all_files)} reports in Markdown format")
+
+    # Upload to NotebookLM
+    from upload import create_notebook, upload_all_sources, configure_notebook, cleanup_temp_files
+    
+    notebook_title = f"{stock_name} 财务深度分析"
+    notebook_id = create_notebook(notebook_title)
+    
+    if notebook_id:
+        # Select prompt
+        prompt_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", prompt_file)
+        configure_notebook(notebook_id, prompt_path)
+        upload_all_sources(notebook_id, all_files)
+        
+        print(f"\n🎉 COMPLETE! Notebook ID: {notebook_id}")
+    
+    cleanup_temp_files(all_files, output_dir)
+
+if __name__ == "__main__":
+    main()

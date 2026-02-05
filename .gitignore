@@ -1,0 +1,25 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.env
+
+# Data
+data/*.pdf
+*.pdf
+temp/
+output/
+
+# OS
+.DS_Store
+
+# Added by github-skill-publisher
+node_modules/
+build/
+*.pyc
+dist/
+.env
+*.egg-info/

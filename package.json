@@ -1,0 +1,21 @@
+{
+    "name": "financial-report-to-notebookllm-skill",
+    "version": "1.1.0",
+    "description": "Download annual and periodic reports for Global stocks (A-share, HK, US) and upload them to NotebookLM.",
+    "scripts": {
+        "start": "python3 scripts/run.py",
+        "analyze": "python3 scripts/run.py"
+    },
+    "keywords": [
+        "cninfo",
+        "hkex",
+        "sec",
+        "edgar",
+        "notebooklm",
+        "stocks",
+        "financial-analysis",
+        "agent-skill"
+    ],
+    "author": "Jarodise",
+    "license": "MIT"
+}
