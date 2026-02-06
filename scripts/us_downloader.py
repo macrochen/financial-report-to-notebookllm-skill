@@ -23,6 +23,8 @@ class SecEdgarDownloader:
 
     def get_cik(self, ticker: str) -> str:
         ticker = ticker.upper()
+        # Handle cases like BRK.B which SEC stores as BRK-B
+        ticker_norm = ticker.replace(".", "-")
         print(f"🔍 Looking up CIK for {ticker}...")
         try:
             # Try to get CIK from the official SEC ticker-to-cik mapping
@@ -30,7 +32,7 @@ class SecEdgarDownloader:
             if resp.status_code == 200:
                 data = resp.json()
                 for item in data.values():
-                    if item["ticker"] == ticker:
+                    if item["ticker"] == ticker or item["ticker"] == ticker_norm:
                         cik = str(item["cik_str"]).zfill(10)
                         print(f"✅ Found CIK: {cik}")
                         return cik

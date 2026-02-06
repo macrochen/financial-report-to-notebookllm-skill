@@ -28,8 +28,8 @@ sys.path.insert(0, script_dir)
 
 def detect_market(stock_input: str) -> str:
     """Detect market based on input string"""
-    # Ticker (US): Letters only
-    if re.match(r"^[A-Za-z]+$", stock_input):
+    # Ticker (US): Letters, dots, and dashes (e.g., BRK.B, BF-B)
+    if re.match(r"^[A-Za-z.-]+$", stock_input):
         return "US"
     # HK Code: 5 digits (can start with 0)
     if re.match(r"^\d{5}$", stock_input):
