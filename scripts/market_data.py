@@ -42,7 +42,9 @@ class MarketDataFetcher:
 
     def __init__(self):
         self.skill_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(self.skill_root)))
+        self.workspace_root = os.path.abspath(
+            os.environ.get("FINANCIAL_REPORT_NOTEBOOKLM_RUNTIME_ROOT", os.getcwd())
+        )
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

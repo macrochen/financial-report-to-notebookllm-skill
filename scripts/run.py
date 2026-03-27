@@ -19,6 +19,9 @@ import subprocess
 # 彻底解决路径问题：自动寻找并使用本地虚拟环境
 script_dir = os.path.dirname(os.path.abspath(__file__))
 skill_root = os.path.dirname(script_dir)
+runtime_root = os.path.abspath(
+    os.environ.get("FINANCIAL_REPORT_NOTEBOOKLM_RUNTIME_ROOT", os.getcwd())
+)
 venv_python = os.path.join(skill_root, ".venv", "bin", "python")
 
 if os.path.exists(venv_python) and sys.executable != venv_python:
@@ -190,6 +193,20 @@ def ensure_output_dir(skill_root_path: str, market: str, stock_input: str) -> st
     return path
 
 
+def get_runtime_data_dir(market: str, stock_input: str) -> str:
+    """Create a persistent runtime data directory outside the skill source tree."""
+    path = os.path.join(runtime_root, "data", f"{market}_{stock_input}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def get_runtime_outputs_dir(market: str, stock_input: str) -> str:
+    """Create a persistent runtime outputs directory outside the skill source tree."""
+    path = os.path.join(runtime_root, "outputs", f"{market}_{stock_input}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def write_text(path: str, content: str):
     """Write text to disk using UTF-8."""
     with open(path, "w", encoding="utf-8") as f:
@@ -304,7 +321,7 @@ def sync_download_failures_to_outputs(market: str, stock_input: str, failures: l
     if not failures:
         return
 
-    output_dir = ensure_output_dir(skill_root, market, stock_input)
+    output_dir = get_runtime_outputs_dir(market, stock_input)
     summary_lines = ["# 下载与转换失败汇总", ""]
 
     for item in failures:
@@ -388,7 +405,7 @@ def title_needs_rename(current_title: str, target_title: str) -> bool:
 def get_notebook_state_path(output_dir: str) -> str:
     """Return the persistent notebook state path for one company."""
     company_key = os.path.basename(output_dir.rstrip(os.sep))
-    return os.path.join(skill_root, "data", company_key, "notebook_state.json")
+    return os.path.join(runtime_root, "data", company_key, "notebook_state.json")
 
 
 def load_notebook_state(output_dir: str) -> dict:
@@ -415,7 +432,7 @@ def fetch_market_snapshot(market: str, stock_input: str, stock_name: str, stock_
     """Fetch latest market snapshot and write a temporary markdown source."""
     from market_data import MarketDataFetcher, snapshot_to_markdown
 
-    analysis_dir = ensure_output_dir(skill_root, market, stock_input)
+    analysis_dir = get_runtime_outputs_dir(market, stock_input)
     analysis_snapshot_path = os.path.join(analysis_dir, "00_latest_market_snapshot.md")
     analysis_error_path = os.path.join(analysis_dir, "00_latest_market_snapshot_error.txt")
     fetcher = MarketDataFetcher()
@@ -622,7 +639,7 @@ def write_summary_input_preview(
     include_recent_developments: bool,
 ) -> str:
     """Save the exact summary inputs for review before asking NotebookLM to summarize."""
-    analysis_dir = ensure_output_dir(skill_root, market, stock_input)
+    analysis_dir = get_runtime_outputs_dir(market, stock_input)
     preview_path = os.path.join(analysis_dir, "00_summary_input_preview.md")
 
     lines = [
@@ -795,7 +812,7 @@ def fetch_recent_developments(
     output_dir: str,
 ) -> tuple[list | None, str | None]:
     """Fetch recent stock-specific developments and save a markdown source."""
-    analysis_dir = ensure_output_dir(skill_root, market, stock_input)
+    analysis_dir = get_runtime_outputs_dir(market, stock_input)
     events_output_path = os.path.join(analysis_dir, "00_recent_developments.md")
     events_data_path = os.path.join(output_dir, "00_recent_developments.md")
     normalized_market = normalize_market_label(market)
@@ -962,7 +979,7 @@ def run_post_upload_analysis(
         list_artifacts,
     )
 
-    analysis_dir = ensure_output_dir(skill_root, market, stock_input)
+    analysis_dir = get_runtime_outputs_dir(market, stock_input)
 
     print(f"\n🧠 Running post-upload analysis for {stock_name}...")
 
@@ -1088,9 +1105,9 @@ def main():
     
     # Use a persistent directory based on stock_input to cache downloads
     # This avoids re-downloading if a previous run failed during upload
-    base_cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-    os.makedirs(base_cache_dir, exist_ok=True)
-    output_dir = os.path.join(base_cache_dir, f"{market}_{stock_input}")
+    os.makedirs(os.path.join(runtime_root, "data"), exist_ok=True)
+    os.makedirs(os.path.join(runtime_root, "outputs"), exist_ok=True)
+    output_dir = get_runtime_data_dir(market, stock_input)
     
     all_files = []
     stock_name = stock_input
@@ -1367,7 +1384,7 @@ def main():
             print("📚 No new financial report sources to upload; reusing existing notebook sources for re-analysis.")
 
         outputs_need_refresh, refresh_reasons = analysis_outputs_need_refresh(
-            ensure_output_dir(skill_root, market, stock_input)
+            get_runtime_outputs_dir(market, stock_input)
         )
         should_run_analysis = bool(files_to_upload) or outputs_need_refresh
 

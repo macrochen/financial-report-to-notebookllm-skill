@@ -27,14 +27,14 @@
    在你的 Agent 终端中运行以下命令（或直接让 Agent 处理）：
 
    ```bash
-   npx skills add jarodise/financial-report-to-notebookllm-skill
+   npx skills add jarodise/financial-report-to-notebooklm-skill
    ```
 
 2. **安装依赖** (首次运行)
    进入目录并运行安装脚本：
 
      ```bash
-     cd financial-report-to-notebookllm-skill && ./install.sh
+     cd financial-report-to-notebooklm-skill && ./install.sh
      ```
 
 3. **认证登录**
@@ -60,7 +60,7 @@ python3 scripts/run.py TSLA
 python3 scripts/run.py 00700
 ```
 
-运行完成后，可在 `outputs/<市场>_<输入>/` 查看结果，通常包括：
+运行完成后，可在你执行命令时所在目录的 `outputs/<市场>_<输入>/` 查看结果，通常包括：
 
 - `00_latest_market_snapshot.md`
 - `01_notebook_summary.md`
@@ -68,14 +68,14 @@ python3 scripts/run.py 00700
 - `99_notebooklm_report.md`
 - `LATEST_NOTEBOOK_ID.txt`
 
-同一家公司后续重跑时，还会在 `data/<市场>_<输入>/notebook_state.json` 记录 notebook 状态，用于复用原有 notebook、跳过已上传财报，并替换旧的市场快照 source。
+同一家公司后续重跑时，还会在你执行命令时所在目录的 `data/<市场>_<输入>/notebook_state.json` 记录 notebook 状态，用于复用原有 notebook、跳过已上传财报，并替换旧的市场快照 source。
+默认情况下，`data/` 和 `outputs/` 都生成在当前工作目录，而不是 Skill 源码目录；如果需要覆盖，可设置环境变量 `FINANCIAL_REPORT_NOTEBOOKLM_RUNTIME_ROOT`。
 如果你已经有旧命名格式的 notebook，可运行 `scripts/rename_legacy_notebooks.py` 批量迁移到新的统一标题。
 
 ## 📂 项目结构
 
 ```
-financial-report-to-notebookllm-skill/
-├── data/               # notebook 复用状态（按公司保存）
+financial-report-to-notebooklm-skill/
 ├── package.json        # 项目元数据
 ├── SKILL.md            # LLM 指令和上下文说明
 ├── install.sh          # 依赖安装脚本
@@ -93,6 +93,13 @@ financial-report-to-notebookllm-skill/
     ├── analysis_questions_cn.json       # A股/港股自动分析问题模板
     ├── analysis_questions_bank.json     # 商业银行自动分析问题模板
     └── analysis_questions_us.json       # 美股自动分析问题模板
+```
+
+运行时会在当前工作目录额外生成：
+
+```text
+./data/                 # 下载缓存、notebook_state.json 等运行态数据
+./outputs/              # summary、report、预确认输入等分析结果
 ```
 
 ## ⚠️ 免责声明

@@ -1,5 +1,5 @@
 {
-    "name": "financial-report-to-notebookllm-skill",
+    "name": "financial-report-to-notebooklm-skill",
     "version": "1.1.0",
     "description": "Download annual and periodic reports for Global stocks (A-share, HK, US) and upload them to NotebookLM.",
     "scripts": {
