@@ -22,6 +22,8 @@ skill_root = os.path.dirname(script_dir)
 runtime_root = os.path.abspath(
     os.environ.get("FINANCIAL_REPORT_NOTEBOOKLM_RUNTIME_ROOT", os.getcwd())
 )
+SKILL_OUTPUT_ROOT = os.path.join(runtime_root, "outputs", "financial-report-to-notebooklm-skill")
+SKILL_STATE_ROOT = os.path.join(SKILL_OUTPUT_ROOT, "_state")
 venv_python = os.path.join(skill_root, ".venv", "bin", "python")
 
 if os.path.exists(venv_python) and sys.executable != venv_python:
@@ -186,23 +188,34 @@ def load_analysis_plan(plan_path: str) -> list:
     return data.get("questions", [])
 
 
-def ensure_output_dir(skill_root_path: str, market: str, stock_input: str) -> str:
-    """Create a persistent directory for analysis outputs."""
-    path = os.path.join(skill_root_path, "outputs", f"{market}_{stock_input}")
-    os.makedirs(path, exist_ok=True)
-    return path
+def slugify_runtime_label(value: str) -> str:
+    """Build a readable filesystem label while preserving company identifiers."""
+    cleaned = re.sub(r"[^\w.-]+", "-", (value or "").strip(), flags=re.UNICODE)
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-._")
+    return cleaned or "untitled"
+
+
+def get_runtime_slug(market: str, stock_input: str) -> str:
+    """Build the shared slug used by runtime outputs and state."""
+    return slugify_runtime_label(f"{normalize_market_label(market)}-{stock_input}")
+
+
+def get_runtime_session_name(market: str, stock_input: str) -> str:
+    """Build the dated output folder name for one run."""
+    date_prefix = datetime.datetime.now().strftime("%Y%m%d")
+    return f"{date_prefix}-{get_runtime_slug(market, stock_input)}"
 
 
 def get_runtime_data_dir(market: str, stock_input: str) -> str:
     """Create a persistent runtime data directory outside the skill source tree."""
-    path = os.path.join(runtime_root, "data", f"{market}_{stock_input}")
+    path = os.path.join(SKILL_STATE_ROOT, get_runtime_slug(market, stock_input), "data")
     os.makedirs(path, exist_ok=True)
     return path
 
 
 def get_runtime_outputs_dir(market: str, stock_input: str) -> str:
     """Create a persistent runtime outputs directory outside the skill source tree."""
-    path = os.path.join(runtime_root, "outputs", f"{market}_{stock_input}")
+    path = os.path.join(SKILL_OUTPUT_ROOT, get_runtime_session_name(market, stock_input))
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -439,8 +452,7 @@ def title_needs_rename(current_title: str, target_title: str) -> bool:
 
 def get_notebook_state_path(output_dir: str) -> str:
     """Return the persistent notebook state path for one company."""
-    company_key = os.path.basename(output_dir.rstrip(os.sep))
-    return os.path.join(runtime_root, "data", company_key, "notebook_state.json")
+    return os.path.join(output_dir, "notebook_state.json")
 
 
 def load_notebook_state(output_dir: str) -> dict:
@@ -1224,8 +1236,8 @@ def main():
     
     # Use a persistent directory based on stock_input to cache downloads
     # This avoids re-downloading if a previous run failed during upload
-    os.makedirs(os.path.join(runtime_root, "data"), exist_ok=True)
-    os.makedirs(os.path.join(runtime_root, "outputs"), exist_ok=True)
+    os.makedirs(SKILL_OUTPUT_ROOT, exist_ok=True)
+    os.makedirs(SKILL_STATE_ROOT, exist_ok=True)
     output_dir = get_runtime_data_dir(market, stock_input)
     
     all_files = []

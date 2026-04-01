@@ -58,9 +58,9 @@ description: 自动从巨潮资讯 (A股)、HKEX (港股) 和 SEC EDGAR (美股)
 Skill 完成上传后，会基于专家模板自动发起“提问-回答”流程：
 *   **问题来源**：内置的分析模板会根据公司类型自动切换。普通公司模板涵盖生意模式、护城河、资本配置、财务质量、反方论证、安全边际与击球区；商业银行模板则重点覆盖监管红线、负债端护城河、资产质量、拨备黑匣子、资本与估值，并显式要求结合最新市场数据快照。
 *   **用途**：利用 NotebookLM 的 RAG（检索增强生成）能力，强制 AI 进行跨年度、跨报表的对比，并生成带有关联引用的深度研报。
-*   **落盘位置**：问答结果、Notebook Summary 和导出的 NotebookLM Report 会保存到当前工作目录下的 `outputs/<市场>_<输入>/` 目录。
-*   **状态持久化**：复用所需的 notebook ID 和 source 列表会保存到当前工作目录下的 `data/<市场>_<输入>/notebook_state.json`，供下次增量更新使用。
-*   **目录边界**：Skill 源码目录保持纯净，`data/` 和 `outputs/` 等运行态文件默认不会写回 Skill 目录；如需自定义运行态根目录，可设置 `FINANCIAL_REPORT_NOTEBOOKLM_RUNTIME_ROOT`。
+*   **落盘位置**：问答结果、Notebook Summary 和导出的 NotebookLM Report 会保存到当前工作目录下的 `outputs/financial-report-to-notebooklm-skill/<yyyymmdd-市场-输入>/` 目录。
+*   **状态持久化**：复用所需的 notebook ID 和 source 列表会保存到当前工作目录下的 `outputs/financial-report-to-notebooklm-skill/_state/<市场-输入>/data/notebook_state.json`，供下次增量更新使用。
+*   **目录边界**：Skill 源码目录保持纯净，所有运行态文件默认不会写回 Skill 目录；如需自定义运行态根目录，可设置 `FINANCIAL_REPORT_NOTEBOOKLM_RUNTIME_ROOT`。
 
 ### 4. 证据溯源与持续交互
 *   **溯源**：报告中的每一个关键结论（如“续订率 92%”）都可以追溯到财报的原件，点击即可查看出处。

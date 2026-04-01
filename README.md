@@ -71,7 +71,7 @@ python3 scripts/run.py TSLA
 python3 scripts/run.py 00700
 ```
 
-运行完成后，可在你执行命令时所在目录的 `outputs/<市场>_<输入>/` 查看结果，通常包括：
+运行完成后，可在你执行命令时所在目录的 `outputs/financial-report-to-notebooklm-skill/<yyyymmdd-市场-输入>/` 查看结果，通常包括：
 
 - `00_latest_market_snapshot.md`
 - `01_notebook_summary.md`
@@ -79,8 +79,8 @@ python3 scripts/run.py 00700
 - `99_notebooklm_report.md`
 - `LATEST_NOTEBOOK_ID.txt`
 
-同一家公司后续重跑时，还会在你执行命令时所在目录的 `data/<市场>_<输入>/notebook_state.json` 记录 notebook 状态，用于复用原有 notebook、跳过已上传财报，并替换旧的市场快照 source。
-默认情况下，`data/` 和 `outputs/` 都生成在当前工作目录，而不是 Skill 源码目录；如果需要覆盖，可设置环境变量 `FINANCIAL_REPORT_NOTEBOOKLM_RUNTIME_ROOT`。
+同一家公司后续重跑时，还会在你执行命令时所在目录的 `outputs/financial-report-to-notebooklm-skill/_state/<市场-输入>/data/notebook_state.json` 记录 notebook 状态，用于复用原有 notebook、跳过已上传财报，并替换旧的市场快照 source。
+默认情况下，运行态文件都会生成在当前工作目录的 `outputs/financial-report-to-notebooklm-skill/` 下，而不是 Skill 源码目录；如果需要覆盖，可设置环境变量 `FINANCIAL_REPORT_NOTEBOOKLM_RUNTIME_ROOT`。
 如果你已经有旧命名格式的 notebook，可运行 `scripts/rename_legacy_notebooks.py` 批量迁移到新的统一标题。
 
 ## 📂 项目结构
