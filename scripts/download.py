@@ -13,7 +13,6 @@ import datetime
 import time
 import random
 import httpx
-from converter import pdf_to_markdown
 
 # Stock database location
 STOCKS_JSON = os.path.join(
@@ -70,7 +69,8 @@ class CnInfoDownloader:
         """Build a dynamic A-share report download plan based on today's date."""
         as_of = as_of or datetime.date.today()
 
-        latest_annual_year = as_of.year - 1
+        # A-share annual reports for year N are typically fully disclosed by Apr 30 of year N+1.
+        latest_annual_year = as_of.year - 1 if as_of >= datetime.date(as_of.year, 5, 1) else as_of.year - 2
         annual_years = list(
             range(latest_annual_year - annual_report_count + 1, latest_annual_year + 1)
         )
@@ -141,7 +141,7 @@ class CnInfoDownloader:
         return announcements
 
     def _download_pdf(self, announcement: dict, output_dir: str) -> str:
-        """Download a single PDF file, returns file path"""
+        """Download a single PDF file and return the PDF path."""
         client = httpx.Client(
             headers=self.headers, cookies=self.cookies, timeout=self.timeout
         )
@@ -159,12 +159,10 @@ class CnInfoDownloader:
         # Clean filename
         filename = "".join(c for c in filename if c.isalnum() or c in "._-")
         filepath = os.path.join(output_dir, filename)
-        md_path = filepath.rsplit(".", 1)[0] + ".md"
-        error_path = filepath.rsplit(".", 1)[0] + "_convert_error.txt"
 
-        if os.path.exists(md_path):
-            print(f"↪️ Reusing existing Markdown: {os.path.basename(md_path)}")
-            return md_path
+        if os.path.exists(filepath):
+            print(f"↪️ Reusing existing PDF: {os.path.basename(filepath)}")
+            return filepath
 
         if not os.path.exists(filepath):
             try:
@@ -173,40 +171,24 @@ class CnInfoDownloader:
                 resp.raise_for_status()
                 with open(filepath, "wb") as f:
                     f.write(resp.content)
+                print(f"✅ Saved PDF: {os.path.basename(filepath)}")
+                return filepath
             except Exception as e:
                 print(f"Download failed: {e}", file=sys.stderr)
                 self.failed_reports.append(
                     {"title": title, "stage": "download", "error": str(e), "path": filepath}
                 )
                 return None
-
-        converted_md_path, convert_error = pdf_to_markdown(filepath, timeout_seconds=90)
-        if converted_md_path:
-            if os.path.exists(error_path):
-                os.remove(error_path)
-            try:
-                os.remove(filepath)  # Keep cache lean once markdown exists
-            except Exception:
-                pass
-            return converted_md_path
-
-        error_text = (
-            f"PDF to Markdown conversion failed\n\n"
-            f"title={title}\n"
-            f"pdf_path={filepath}\n"
-            f"error={convert_error or 'Unknown conversion error'}\n"
-        )
-        with open(error_path, "w", encoding="utf-8") as f:
-            f.write(error_text)
-        print(f"⚠️ Conversion failed, saved log: {os.path.basename(error_path)}")
-        self.failed_reports.append(
-            {"title": title, "stage": "convert", "error": convert_error or "Unknown conversion error", "path": error_path}
-        )
-        return None
+        return filepath if os.path.exists(filepath) else None
 
     def _is_main_annual_report(self, title: str, year: int) -> bool:
         """Check if this is the main annual report (not summary/English)"""
-        if f"{year}年年度报告" not in title and f"{year}年年报" not in title:
+        annual_markers = (
+            f"{year}年度报告",
+            f"{year}年年度报告",
+            f"{year}年报",
+        )
+        if not any(marker in title for marker in annual_markers):
             return False
         if "摘要" in title or "英文" in title or "summary" in title.lower():
             return False
@@ -240,15 +222,17 @@ class CnInfoDownloader:
             # Annual reports are published in the following year (March-April)
             search_start = f"{year + 1}-01-01"
             search_end = f"{year + 1}-06-30"
-
-            filter_params = {
-                "stock": [stock_code],
-                "category": ["category_ndbg_szsh"],  # Annual reports
-                "searchkey": f"{year}年年度报告",
-                "seDate": f"{search_start}~{search_end}",
-            }
-
-            announcements = self._query_announcements(filter_params)
+            announcements = []
+            for searchkey in (f"{year}年年度报告", f"{year}年度报告", "年度报告"):
+                filter_params = {
+                    "stock": [stock_code],
+                    "category": ["category_ndbg_szsh"],  # Annual reports
+                    "searchkey": searchkey,
+                    "seDate": f"{search_start}~{search_end}",
+                }
+                announcements = self._query_announcements(filter_params)
+                if announcements:
+                    break
 
             for ann in announcements:
                 if self._is_main_annual_report(ann["announcementTitle"], year):

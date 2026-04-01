@@ -18,6 +18,7 @@
 - 🧠 **自动分析落盘**: 自动保存 Notebook Summary、主题问答结果和 NotebookLM 生成的 Markdown 研报。
 - 🧹 **自动清理**: 上传完成后自动清理临时文件，保持系统整洁。
 - 🔐 **稳定登录**: 使用 `notebooklm-py` 确保鉴权稳定可靠。
+- 🧩 **默认 API 路径**: 运行时默认优先走 `notebooklm-py` 的 Python API，CLI 仅在 API 失败时自动回退。
 
 ## 🚀 使用方法
 
@@ -43,6 +44,16 @@
    ```bash
    .venv/bin/notebooklm login
    ```
+
+### 执行路径说明
+
+- 默认：Python API（`notebooklm-py`）
+- 回退：NotebookLM CLI
+- 如需临时强制使用旧 CLI 路径：
+
+```bash
+export FINANCIAL_REPORT_NOTEBOOKLM_FORCE_CLI=1
+```
 
 ### 运行工具
 

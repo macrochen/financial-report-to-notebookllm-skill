@@ -213,6 +213,15 @@ def write_text(path: str, content: str):
         f.write(content)
 
 
+def remove_file_if_exists(path: str):
+    """Best-effort removal for obsolete local artifacts."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
 def get_notebook_url(notebook_id: str) -> str:
     """Build the direct NotebookLM URL for one notebook."""
     return f"https://notebooklm.google.com/notebook/{notebook_id}"
@@ -387,12 +396,36 @@ def resolve_existing_notebook(notebook_id: str, notebook_state: dict) -> tuple[b
     return False, last_source_map, notebook_title_map
 
 
+def find_notebook_by_title(notebook_title: str) -> tuple[str | None, dict]:
+    """Find an existing notebook by its exact normalized title."""
+    from upload import list_notebooks
+
+    notebooks_ok, notebook_list = list_notebooks()
+    if not notebooks_ok:
+        return None, {}
+
+    wanted = (notebook_title or "").strip()
+    for item in notebook_list:
+        if (item.get("title") or "").strip() == wanted:
+            notebook_id = item.get("id")
+            if notebook_id:
+                return notebook_id, item
+    return None, {}
+
+
 def format_notebook_title(market: str, stock_code: str, stock_name: str) -> str:
     """Build a stable notebook title for easy scanning and deduping."""
     safe_market = normalize_market_label(market)
     safe_code = (stock_code or "UNKNOWN").strip().upper()
     safe_name = " ".join((stock_name or safe_code).strip().split())
-    if safe_name.upper() == safe_code:
+    placeholder_names = {
+        safe_code,
+        f"{safe_market}_{safe_code}",
+        f"HK_{safe_code}",
+        f"CN_{safe_code}",
+        f"US_{safe_code}",
+    }
+    if safe_name.upper() in {name.upper() for name in placeholder_names}:
         return f"[{safe_market}] {safe_code} - 财报分析"
     return f"[{safe_market}] {safe_code} {safe_name} - 财报分析"
 
@@ -485,8 +518,7 @@ def build_summary_fallback(stock_name: str) -> str:
     return (
         f"# {stock_name} NotebookLM 摘要暂不可用\n\n"
         "NotebookLM 本次没有返回可用 summary，因此这里不再写入空白占位内容。\n\n"
-        "请直接查看后续问答文件（`02_*` 到 `07_*`）以及 `99_notebooklm_report.md`，"
-        "其中已经包含本轮分析的主要结论。\n"
+        "请直接打开对应的 NotebookLM 笔记本，在对话区查看本轮问答结果。\n"
     )
 
 
@@ -505,8 +537,6 @@ def analysis_outputs_need_refresh(output_dir: str) -> tuple[bool, list]:
     """Decide whether saved NotebookLM outputs are missing or unusable."""
     required_files = [
         "01_notebook_summary.md",
-        "98_notebook_artifacts.json",
-        "99_notebooklm_report.md",
     ]
     missing = [
         filename
@@ -538,6 +568,12 @@ def analysis_outputs_need_refresh(output_dir: str) -> tuple[bool, list]:
 
 def filter_cached_files(market: str, files: list) -> list:
     """Filter out stale cached files that are not real financial reports."""
+    if market.startswith("CN"):
+        return [
+            file_path for file_path in files
+            if str(file_path).lower().endswith(".pdf")
+        ]
+
     if market != "HK":
         return files
 
@@ -546,6 +582,8 @@ def filter_cached_files(market: str, files: list) -> list:
     downloader = HkexDownloader()
     filtered = []
     for file_path in files:
+        if not str(file_path).lower().endswith(".pdf"):
+            continue
         title = os.path.splitext(os.path.basename(file_path))[0]
         if downloader.is_financial_report_title(title):
             filtered.append(file_path)
@@ -559,6 +597,98 @@ def hk_cache_needs_refresh(files: list) -> bool:
     return len(files) < 3
 
 
+def split_cn_current_report_entries(entries: list, report_plan: dict) -> tuple[list, list]:
+    """Keep only A-share reports that match the active annual/periodic plan."""
+    if not entries:
+        return [], []
+
+    allowed_markers = get_cn_report_markers(report_plan)
+    recent = []
+    stale = []
+
+    for entry in entries:
+        raw_name = os.path.basename(entry) if isinstance(entry, str) else str(entry)
+        base = os.path.splitext(raw_name)[0]
+        matched = any(
+            any(pattern in base for pattern in marker["patterns"])
+            for marker in allowed_markers
+        )
+        if matched:
+            recent.append(entry)
+        else:
+            stale.append(entry)
+    return recent, stale
+
+
+def split_recent_hk_report_entries(entries: list) -> tuple[list, list]:
+    """Split HK report-like entries into recent-window items and stale historical items."""
+    if not entries:
+        return [], []
+
+    from hk_downloader import HkexDownloader
+
+    downloader = HkexDownloader()
+    wrapped = []
+    for entry in entries:
+        raw_name = os.path.basename(entry) if isinstance(entry, str) else str(entry)
+        title = os.path.splitext(raw_name)[0]
+        wrapped.append({"entry": entry, "title": title})
+
+    kept_titles = {
+        item["title"]
+        for item in downloader.keep_recent_report_years(
+            [{"title": item["title"]} for item in wrapped]
+        )
+    }
+    recent = [item["entry"] for item in wrapped if item["title"] in kept_titles]
+    stale = [item["entry"] for item in wrapped if item["title"] not in kept_titles]
+    return recent, stale
+
+
+def split_recent_us_report_entries(entries: list) -> tuple[list, list]:
+    """Keep only the latest 5 annual filings and latest 3 periodic filings for US stocks."""
+    if not entries:
+        return [], []
+
+    annual = []
+    periodic = []
+    stale = []
+
+    for entry in entries:
+        raw_name = os.path.basename(entry) if isinstance(entry, str) else str(entry)
+        base = os.path.splitext(raw_name)[0]
+        match = re.search(
+            r"(?P<ticker>[A-Za-z.\-]+)_(?P<form>10K|20F|10Q|6K)_(?P<date>\d{4}-\d{2}-\d{2})$",
+            base,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            stale.append(entry)
+            continue
+
+        normalized = {
+            "entry": entry,
+            "form": match.group("form").upper(),
+            "date": match.group("date"),
+        }
+        if normalized["form"] in {"10K", "20F"}:
+            annual.append(normalized)
+        else:
+            periodic.append(normalized)
+
+    annual.sort(key=lambda item: item["date"], reverse=True)
+    periodic.sort(key=lambda item: item["date"], reverse=True)
+
+    kept_entries = {
+        item["entry"]
+        for item in annual[:5] + periodic[:3]
+    }
+    recent = [entry for entry in entries if entry in kept_entries]
+    stale.extend([item["entry"] for item in annual[5:]])
+    stale.extend([item["entry"] for item in periodic[3:]])
+    return recent, stale
+
+
 def get_cn_report_markers(report_plan: dict) -> list:
     """Return expected A-share report markers for cache freshness checks."""
     markers = []
@@ -567,7 +697,7 @@ def get_cn_report_markers(report_plan: dict) -> list:
         markers.append(
             {
                 "label": f"{year} annual",
-                "patterns": [f"{year}年年度报告", f"{year}年年报"],
+                "patterns": [f"{year}年度报告", f"{year}年年度报告", f"{year}年年报", f"{year}_annual"],
             }
         )
 
@@ -577,18 +707,21 @@ def get_cn_report_markers(report_plan: dict) -> list:
             "{year}年一季度报告",
             "{year}年第一季度",
             "{year}年一季度",
+            "{year}_q1",
         ],
         "semi": [
             "{year}年半年度报告",
             "{year}年中期报告",
             "{year}年半年度",
             "{year}年中期",
+            "{year}_semi",
         ],
         "q3": [
             "{year}年第三季度报告",
             "{year}年三季度报告",
             "{year}年第三季度",
             "{year}年三季度",
+            "{year}_q3",
         ],
     }
 
@@ -605,9 +738,13 @@ def get_cn_report_markers(report_plan: dict) -> list:
     return markers
 
 
-def get_missing_cn_reports(files: list, report_plan: dict) -> list:
-    """Check whether cached A-share files cover the latest expected report set."""
-    basenames = [os.path.splitext(os.path.basename(file_path))[0] for file_path in files]
+def get_missing_cn_reports_from_names(names: list[str], report_plan: dict) -> list:
+    """Check whether a set of source/file names covers the latest expected A-share report set."""
+    basenames = [
+        os.path.splitext(os.path.basename(name))[0]
+        for name in names
+        if name
+    ]
     missing = []
 
     for marker in get_cn_report_markers(report_plan):
@@ -615,6 +752,11 @@ def get_missing_cn_reports(files: list, report_plan: dict) -> list:
             missing.append(marker["label"])
 
     return missing
+
+
+def get_missing_cn_reports(files: list, report_plan: dict) -> list:
+    """Check whether cached A-share files cover the latest expected report set."""
+    return get_missing_cn_reports_from_names(files, report_plan)
 
 
 def dedupe_file_paths(files: list[str]) -> list[str]:
@@ -972,16 +1114,19 @@ def run_post_upload_analysis(
     include_recent_developments: bool = False,
     is_bank_stock_profile: bool = False,
 ):
-    """Use NotebookLM to produce one directional summary plus a final report."""
+    """Use NotebookLM chat to produce one directional summary plus a final memo in the notebook."""
     from upload import (
         ask_notebook_question,
-        download_report,
-        generate_report,
-        get_conversation_history,
-        list_artifacts,
     )
 
     analysis_dir = get_runtime_outputs_dir(market, stock_input)
+    for obsolete_name in (
+        "98_conversation_history.txt",
+        "98_notebook_artifacts.json",
+        "99_notebooklm_report.md",
+        "99_report_artifact.json",
+    ):
+        remove_file_if_exists(os.path.join(analysis_dir, obsolete_name))
 
     print(f"\n🧠 Running post-upload analysis for {stock_name}...")
 
@@ -1037,62 +1182,34 @@ def run_post_upload_analysis(
         write_text(snapshot_output_path, snapshot_to_markdown(market_snapshot))
         print(f"   📊 Saved latest market snapshot: {snapshot_output_path}")
 
-    report_stage = log_stage_start("NotebookLM report generation")
+    report_stage = log_stage_start("NotebookLM chat memo")
     report_prompt = build_report_prompt(
         stock_name,
         is_bank_stock_profile,
         include_recent_developments=include_recent_developments,
     )
-    report_ok, report_output, artifact_id = generate_report(notebook_id, description=report_prompt)
-    report_meta_path = os.path.join(analysis_dir, "99_report_artifact.json")
-    write_text(report_meta_path, report_output)
-
+    report_ok, report_output = ask_notebook_question(notebook_id, report_prompt, new_conversation=False)
     if report_ok:
-        report_md_path = os.path.join(analysis_dir, "99_notebooklm_report.md")
-        downloaded, download_output = download_report(notebook_id, report_md_path, artifact_id=artifact_id)
-        if downloaded:
-            print(f"   📄 Saved NotebookLM report: {report_md_path}")
-        else:
-            error_path = os.path.join(analysis_dir, "99_report_download_error.txt")
-            write_text(error_path, download_output)
-            print(f"   ⚠️ Report generated but download failed: {error_path}")
+        print("   ✅ NotebookLM chat memo generated successfully inside the notebook.")
     else:
-        print("   ⚠️ Report generation failed; raw artifact output has been saved.")
-    log_stage_end("NotebookLM report generation", report_stage)
-
-    artifact_stage = log_stage_start("Notebook artifact listing")
-    artifacts_ok, artifacts, artifacts_output = list_artifacts(notebook_id)
-    artifacts_path = os.path.join(analysis_dir, "98_notebook_artifacts.json")
-    if artifacts_ok:
-        write_text(
-            artifacts_path,
-            json.dumps(
-                {
-                    "notebook_id": notebook_id,
-                    "artifact_count": len(artifacts),
-                    "artifacts": artifacts,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
-        )
-    else:
-        write_text(artifacts_path, artifacts_output)
-    print(f"   🧾 Saved notebook artifact listing: {artifacts_path}")
-    log_stage_end("Notebook artifact listing", artifact_stage)
-
-    history_stage = log_stage_start("Notebook history fetch")
-    history_ok, history_output = get_conversation_history(notebook_id, limit=20)
-    history_path = os.path.join(analysis_dir, "98_conversation_history.txt")
-    if history_ok:
-        write_text(history_path, history_output)
-    else:
-        write_text(history_path, f"History fetch failed:\n\n{history_output}")
-    print(f"   💬 Saved notebook conversation history: {history_path}")
-    log_stage_end("Notebook history fetch", history_stage)
+        clipboard_ok, clipboard_error = copy_text_to_clipboard(report_prompt)
+        browser_ok, browser_output = open_notebook_in_browser(notebook_id)
+        print("   ⚠️ NotebookLM chat memo failed; opened the notebook for manual continuation.")
+        print(f"   🔗 NotebookLM URL: {get_notebook_url(notebook_id)}")
+        if not clipboard_ok and clipboard_error:
+            print(f"   ⚠️ Clipboard copy failed: {clipboard_error}")
+        if not browser_ok and browser_output:
+            print(f"   ⚠️ Browser open failed: {browser_output}")
+    log_stage_end("NotebookLM chat memo", report_stage)
 
     write_text(os.path.join(analysis_dir, "LATEST_NOTEBOOK_ID.txt"), notebook_id + "\n")
+    browser_ok, browser_output = open_notebook_in_browser(notebook_id)
+    if browser_ok:
+        print(f"   🌐 Opened notebook in browser: {browser_output}")
+    else:
+        print(f"   🔗 NotebookLM URL: {get_notebook_url(notebook_id)}")
+        if browser_output:
+            print(f"   ⚠️ Browser open failed: {browser_output}")
     print(f"   📁 Analysis outputs directory: {analysis_dir}")
 
 def main():
@@ -1117,43 +1234,193 @@ def main():
     prompt_file = "financial_analyst_prompt.md"
     analysis_profile = "general"
     cn_report_plan = None
+    notebook_state = {}
+    notebook_title = ""
+    notebook_id = None
+    existing_source_map = {}
+    notebook_title_map = {}
+    notebook_report_context_ready = False
+    ephemeral_files = []
 
     print(f"🔍 Detected Market: {market}")
+
+    metadata_stage = log_stage_start("Stock metadata resolve")
+    if market == "US":
+        prompt_file = "us_financial_analyst_prompt.md"
+        from us_downloader import SecEdgarDownloader
+
+        downloader = SecEdgarDownloader()
+        stock_name = downloader.get_company_name(stock_input) or stock_input.upper()
+        stock_code = stock_input.upper()
+    elif market == "HK":
+        from hk_downloader import HkexDownloader
+
+        downloader = HkexDownloader()
+        stock_name = downloader.get_company_name(stock_input) or stock_input.zfill(5)
+        stock_code = stock_input.zfill(5)
+    else:
+        from download import CnInfoDownloader
+
+        downloader = CnInfoDownloader()
+        resolved_stock_code, stock_info = downloader.find_stock(stock_input)
+        if resolved_stock_code:
+            stock_code = resolved_stock_code
+            stock_name = stock_info.get("zwjc", stock_code)
+            cn_report_plan = downloader.build_report_plan()
+        else:
+            print(f"❌ Stock not found: {stock_input}")
+            sys.exit(1)
+    log_stage_end("Stock metadata resolve", metadata_stage)
+
+    notebook_state = load_notebook_state(output_dir)
+    notebook_title = format_notebook_title(market, stock_code, stock_name)
+
+    notebook_inventory_stage = log_stage_start("Notebook inventory check")
+    notebook_id = notebook_state.get("notebook_id")
+    from upload import get_existing_source_map
+
+    if notebook_id:
+        state_ok, existing_source_map, notebook_title_map = resolve_existing_notebook(
+            notebook_id,
+            notebook_state,
+        )
+        if state_ok:
+            print(f"🔁 Found saved notebook: {notebook_id}")
+        else:
+            print("⚠️ Saved notebook state exists, but the notebook could not be reused directly.")
+            notebook_id = None
+            existing_source_map = {}
+
+    if not notebook_id:
+        matched_notebook_id, matched_notebook = find_notebook_by_title(notebook_title)
+        if matched_notebook_id:
+            notebook_id = matched_notebook_id
+            source_map_ok, existing_source_map = get_existing_source_map(notebook_id)
+            if source_map_ok:
+                print(
+                    "🔎 Found existing notebook by title: "
+                    f"{matched_notebook.get('title', notebook_title)} ({notebook_id})"
+                )
+            else:
+                existing_source_map = {}
+                print(f"⚠️ Found notebook by title but could not read its sources: {notebook_id}")
+
+    if notebook_id and existing_source_map:
+        notebook_source_names = []
+        for normalized_name, sources in existing_source_map.items():
+            if sources:
+                notebook_source_names.extend(
+                    source.get("title", normalized_name)
+                    for source in sources
+                    if source.get("title") or normalized_name
+                )
+
+        if market.startswith("CN") and cn_report_plan:
+            current_cn_sources, stale_cn_sources = split_cn_current_report_entries(notebook_source_names, cn_report_plan)
+            if stale_cn_sources:
+                print(
+                    "🧹 Existing notebook contains stale A-share reports outside the active plan: "
+                    + ", ".join(os.path.basename(name) for name in stale_cn_sources[:10])
+                )
+            missing_reports = get_missing_cn_reports_from_names(current_cn_sources, cn_report_plan)
+            if missing_reports:
+                print(
+                    "📚 Existing notebook is missing expected A-share reports: "
+                    + ", ".join(missing_reports)
+                )
+            else:
+                notebook_report_context_ready = True
+                print("✅ Existing notebook already has the expected A-share report set.")
+        elif market == "HK":
+            report_like_sources = filter_cached_files(market, notebook_source_names)
+            recent_hk_sources, stale_hk_sources = split_recent_hk_report_entries(report_like_sources)
+            if stale_hk_sources:
+                print(
+                    "🧹 Existing notebook contains stale HK reports outside the 5-year window: "
+                    + ", ".join(os.path.basename(name) for name in stale_hk_sources[:10])
+                )
+            if hk_cache_needs_refresh(recent_hk_sources):
+                print(
+                    "📚 Existing notebook has too few HK financial report sources "
+                    f"({len(recent_hk_sources)}); will refresh downloads."
+                )
+            else:
+                notebook_report_context_ready = True
+                print("✅ Existing notebook already has a usable HK report set.")
+        elif market == "US":
+            report_like_sources = [
+                name for name in notebook_source_names
+                if any(marker in name.lower() for marker in ("10-k", "10-q", "20-f", "6-k", "annual", "quarter"))
+            ]
+            recent_us_sources, stale_us_sources = split_recent_us_report_entries(report_like_sources)
+            if stale_us_sources:
+                print(
+                    "🧹 Existing notebook contains stale US filings outside the target window: "
+                    + ", ".join(os.path.basename(name) for name in stale_us_sources[:10])
+                )
+            if recent_us_sources:
+                notebook_report_context_ready = True
+                print(
+                    "✅ Existing notebook already has report-like US sources: "
+                    f"{len(recent_us_sources)}"
+                )
+            else:
+                print("📚 Existing notebook has no recognizable US financial report sources; will refresh downloads.")
+
+    if notebook_id and not existing_source_map:
+        print("📚 Notebook source inventory is unavailable, so the run will fall back to local cache/download checks.")
+
+    log_stage_end("Notebook inventory check", notebook_inventory_stage)
     
-    # Check if we already have files in the cache
-    if os.path.exists(output_dir) and os.listdir(output_dir):
+    # Check local cache only when the notebook itself is not already complete.
+    if not notebook_report_context_ready and os.path.exists(output_dir) and os.listdir(output_dir):
         cache_stage = log_stage_start("Cache scan")
         print(f"📦 Found existing reports in cache: {output_dir}")
         all_files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.endswith(".md") or f.endswith(".pdf")]
         all_files = filter_cached_files(market, all_files)
 
         if market.startswith("CN"):
-            from download import CnInfoDownloader
-
-            downloader = CnInfoDownloader()
-            resolved_stock_code, stock_info = downloader.find_stock(stock_input)
-            if resolved_stock_code:
-                stock_code = resolved_stock_code
-                stock_name = stock_info.get("zwjc", stock_code)
-                cn_report_plan = downloader.build_report_plan()
-                missing_reports = get_missing_cn_reports(all_files, cn_report_plan)
-                if missing_reports:
-                    print(
-                        "⚠️ Cached A-share reports are missing the latest expected set: "
-                        + ", ".join(missing_reports)
-                    )
-                    print("🔄 Refreshing A-share downloads to avoid using stale reports...")
-                    all_files = []
-        elif market == "HK" and hk_cache_needs_refresh(all_files):
-            print(
-                "⚠️ Cached HK reports look incomplete "
-                f"({len(all_files)} file(s)); refreshing downloads..."
-            )
-            all_files = []
+            recent_cn_files, stale_cn_files = split_cn_current_report_entries(all_files, cn_report_plan)
+            if stale_cn_files:
+                print(
+                    "🧹 Ignoring stale cached A-share reports outside the active plan: "
+                    + ", ".join(os.path.basename(path) for path in stale_cn_files[:10])
+                )
+            all_files = recent_cn_files
+            missing_reports = get_missing_cn_reports(all_files, cn_report_plan)
+            if missing_reports:
+                print(
+                    "⚠️ Cached A-share reports are missing the latest expected set: "
+                    + ", ".join(missing_reports)
+                )
+                print("🔄 Refreshing A-share downloads to avoid using stale reports...")
+                all_files = []
+        elif market == "HK":
+            recent_hk_files, stale_hk_files = split_recent_hk_report_entries(all_files)
+            if stale_hk_files:
+                print(
+                    "🧹 Ignoring stale cached HK reports outside the 5-year window: "
+                    + ", ".join(os.path.basename(path) for path in stale_hk_files[:10])
+                )
+            all_files = recent_hk_files
+            if hk_cache_needs_refresh(all_files):
+                print(
+                    "⚠️ Cached HK reports look incomplete "
+                    f"({len(all_files)} file(s)); refreshing downloads..."
+                )
+                all_files = []
+        elif market == "US":
+            recent_us_files, stale_us_files = split_recent_us_report_entries(all_files)
+            if stale_us_files:
+                print(
+                    "🧹 Ignoring stale cached US filings outside the target window: "
+                    + ", ".join(os.path.basename(path) for path in stale_us_files[:10])
+                )
+            all_files = recent_us_files
         log_stage_end("Cache scan", cache_stage)
     
-    # If no files found, proceed to download
-    if not all_files:
+    # Download only when neither the notebook nor the local cache is complete.
+    if not notebook_report_context_ready and not all_files:
         download_stage = log_stage_start("Report download")
         download_failures = []
         os.makedirs(output_dir, exist_ok=True)
@@ -1169,8 +1436,8 @@ def main():
             downloader = HkexDownloader()
             reps = downloader.find_reports(stock_input)
             all_files = downloader.download_and_convert(reps, output_dir)
-            stock_name = f"HK_{stock_input}"
-            stock_code = stock_input
+            stock_name = downloader.last_company_name or downloader.get_company_name(stock_input) or stock_input.zfill(5)
+            stock_code = stock_input.zfill(5)
         else:
             from download import CnInfoDownloader
             downloader = CnInfoDownloader()
@@ -1203,34 +1470,17 @@ def main():
                     f"-> {item.get('path', 'N/A')}"
                 )
             sync_download_failures_to_outputs(market, stock_input, download_failures)
-    else:
-        cache_resolve_stage = log_stage_start("Cache metadata resolve")
-        # Determine stock_name for existing cache
-        if market == "US":
-            prompt_file = "us_financial_analyst_prompt.md"
-            from us_downloader import SecEdgarDownloader
-            downloader = SecEdgarDownloader()
-            stock_name = downloader.get_company_name(stock_input) or stock_input.upper()
-            stock_code = stock_input.upper()
-        elif market == "HK":
-            stock_name = f"HK_{stock_input}"
-            stock_code = stock_input
-        else:
-            from download import CnInfoDownloader
-            downloader = CnInfoDownloader()
-            resolved_stock_code, stock_info = downloader.find_stock(stock_input)
-            if resolved_stock_code:
-                stock_code = resolved_stock_code
-                stock_name = stock_info.get("zwjc", stock_code)
-        log_stage_end("Cache metadata resolve", cache_resolve_stage)
 
-    if not all_files:
+    if not all_files and not notebook_report_context_ready:
         print("❌ No reports downloaded")
         if os.path.exists(output_dir) and not os.listdir(output_dir):
             os.rmdir(output_dir)
         sys.exit(1)
 
-    print(f"\n✅ Processed {len(all_files)} reports")
+    if all_files:
+        print(f"\n✅ Processed {len(all_files)} reports")
+    else:
+        print("\n✅ Reusing existing NotebookLM report sources; no financial report download needed")
 
     is_bank_stock_profile, bank_reasons = detect_bank_stock(stock_input, stock_name, all_files)
     prompt_file, analysis_profile = get_analysis_assets(market, is_bank_stock_profile)
@@ -1300,30 +1550,15 @@ def main():
         wait_for_sources,
     )
     
-    notebook_state = load_notebook_state(output_dir)
-    notebook_title = format_notebook_title(market, stock_code, stock_name)
-    notebook_id = notebook_state.get("notebook_id")
-    existing_source_map = {}
-    notebook_title_map = {}
-
     if notebook_id:
-        state_ok, existing_source_map, notebook_title_map = resolve_existing_notebook(
-            notebook_id,
-            notebook_state,
-        )
-        if state_ok:
-            print(f"🔁 Reusing existing notebook: {notebook_id}")
-            current_title = notebook_title_map.get(notebook_id, notebook_state.get("notebook_title", ""))
-            if title_needs_rename(current_title, notebook_title):
-                renamed_ok, rename_output = rename_notebook(notebook_id, notebook_title)
-                if renamed_ok:
-                    print(f"🏷️ Renamed legacy notebook title: {current_title} -> {notebook_title}")
-                else:
-                    print(f"⚠️ Failed to rename notebook title: {rename_output}")
-        else:
-            print("⚠️ Saved notebook could not be reused; creating a new notebook...")
-            notebook_id = None
-            existing_source_map = {}
+        print(f"🔁 Reusing existing notebook: {notebook_id}")
+        current_title = notebook_title_map.get(notebook_id, notebook_state.get("notebook_title", ""))
+        if title_needs_rename(current_title, notebook_title):
+            renamed_ok, rename_output = rename_notebook(notebook_id, notebook_title)
+            if renamed_ok:
+                print(f"🏷️ Renamed legacy notebook title: {current_title} -> {notebook_title}")
+            else:
+                print(f"⚠️ Failed to rename notebook title: {rename_output}")
 
     if not notebook_id:
         notebook_id = create_notebook(notebook_title)
@@ -1352,6 +1587,66 @@ def main():
         source_map_ok, existing_source_map = get_existing_source_map(notebook_id)
         if not source_map_ok:
             existing_source_map = {}
+        elif market.startswith("CN") and cn_report_plan:
+            notebook_report_titles = []
+            for sources in existing_source_map.values():
+                for source in sources:
+                    title = source.get("title")
+                    if title:
+                        notebook_report_titles.append(title)
+            report_like_titles = [
+                title for title in notebook_report_titles
+                if any(token in title for token in ("年度报告", "年报", "半年度报告", "中期报告", "一季度", "第一季度", "三季度", "第三季度"))
+            ]
+            _, stale_cn_titles = split_cn_current_report_entries(report_like_titles, cn_report_plan)
+            if stale_cn_titles:
+                removed_ok, removed_ids = remove_matching_sources(notebook_id, stale_cn_titles)
+                if removed_ok and removed_ids:
+                    print(f"🧹 Removed stale A-share notebook source(s): {len(removed_ids)}")
+                    source_map_ok, existing_source_map = get_existing_source_map(notebook_id)
+                    if not source_map_ok:
+                        existing_source_map = {}
+                else:
+                    print("⚠️ Failed to remove some stale A-share notebook sources; analysis may still include old reports.")
+        elif market == "HK":
+            notebook_report_titles = []
+            for sources in existing_source_map.values():
+                for source in sources:
+                    title = source.get("title")
+                    if title:
+                        notebook_report_titles.append(title)
+            report_like_titles = filter_cached_files(market, notebook_report_titles)
+            _, stale_hk_titles = split_recent_hk_report_entries(report_like_titles)
+            if stale_hk_titles:
+                removed_ok, removed_ids = remove_matching_sources(notebook_id, stale_hk_titles)
+                if removed_ok and removed_ids:
+                    print(f"🧹 Removed stale HK notebook source(s): {len(removed_ids)}")
+                    source_map_ok, existing_source_map = get_existing_source_map(notebook_id)
+                    if not source_map_ok:
+                        existing_source_map = {}
+                else:
+                    print("⚠️ Failed to remove some stale HK notebook sources; analysis may still include old reports.")
+        elif market == "US":
+            notebook_report_titles = []
+            for sources in existing_source_map.values():
+                for source in sources:
+                    title = source.get("title")
+                    if title:
+                        notebook_report_titles.append(title)
+            report_like_titles = [
+                title for title in notebook_report_titles
+                if any(marker in title.lower() for marker in ("10-k", "10-q", "20-f", "6-k", "10k", "10q", "20f", "6k"))
+            ]
+            _, stale_us_titles = split_recent_us_report_entries(report_like_titles)
+            if stale_us_titles:
+                removed_ok, removed_ids = remove_matching_sources(notebook_id, stale_us_titles)
+                if removed_ok and removed_ids:
+                    print(f"🧹 Removed stale US notebook source(s): {len(removed_ids)}")
+                    source_map_ok, existing_source_map = get_existing_source_map(notebook_id)
+                    if not source_map_ok:
+                        existing_source_map = {}
+                else:
+                    print("⚠️ Failed to remove some stale US notebook sources; analysis may still include old filings.")
         log_stage_end("Notebook setup", notebook_stage)
 
         files_to_upload = []
@@ -1383,8 +1678,13 @@ def main():
             if upload_results.get("source_ids"):
                 print("\n⏳ Waiting for NotebookLM to finish processing sources...")
                 wait_stage = log_stage_start("Source processing wait")
-                wait_for_sources(notebook_id, upload_results["source_ids"], timeout=600)
+                wait_results = wait_for_sources(notebook_id, upload_results["source_ids"], timeout=600)
                 log_stage_end("Source processing wait", wait_stage)
+                if wait_results.get("failed"):
+                    print("❌ Some sources did not reach ready state in time; skipping analysis to avoid partial context.")
+                    for failed in wait_results["failed"]:
+                        print(f"   - {failed['source_id']}: {failed['output']}")
+                    sys.exit(1)
         else:
             print("📚 No new financial report sources to upload; reusing existing notebook sources for re-analysis.")
 
@@ -1395,10 +1695,10 @@ def main():
 
         if should_run_analysis:
             if files_to_upload:
-                print("🧠 New or refreshed sources detected; regenerating NotebookLM summary and report.")
+                print("🧠 New or refreshed sources detected; regenerating NotebookLM summary and chat memo.")
             else:
                 print(
-                    "🧠 Financial reports are already up to date, but saved analysis artifacts need refresh: "
+                    "🧠 Financial reports are already up to date, but saved analysis outputs need refresh: "
                     + ", ".join(refresh_reasons)
                 )
             analysis_stage = log_stage_start("Post-upload analysis")
@@ -1413,7 +1713,7 @@ def main():
             )
             log_stage_end("Post-upload analysis", analysis_stage)
         else:
-            print("✅ Financial reports and NotebookLM summary/report are already up to date; skipping re-analysis.")
+            print("✅ Financial reports and NotebookLM chat outputs are already up to date; skipping re-analysis.")
 
         source_list_stage = log_stage_start("Final source listing")
         listed_ok, listed_sources = list_sources(notebook_id)
@@ -1437,7 +1737,7 @@ def main():
         print(f"📚 Notebook Title: {notebook_title}")
         cleanup_stage = log_stage_start("Cleanup")
         try:
-            cleanup_temp_files(all_files, output_dir)
+            cleanup_temp_files(ephemeral_files, output_dir)
         except Exception as e:
             print(f"⚠️ Cleanup failed but will not block exit: {e}")
         finally:

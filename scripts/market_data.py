@@ -55,6 +55,9 @@ class MarketDataFetcher:
             "Connection": "close",
         }
         self.client = httpx.Client(headers=self.headers, timeout=30.0, follow_redirects=True)
+        self.enable_xueqiu_validation = os.environ.get(
+            "FINANCIAL_REPORT_NOTEBOOKLM_ENABLE_XUEQIU_VALIDATION", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
     def normalized_market(self, market: str) -> str:
         """Normalize internal market variants to the public market label."""
@@ -338,26 +341,35 @@ class MarketDataFetcher:
                 "validation_provider": None,
                 "validation_notes": [],
             }
-            try:
-                xueqiu_symbol = self.xueqiu_symbol(normalized_market, stock_input, stock_code=stock_code)
-                validation_quote = self.fetch_xueqiu_quote(xueqiu_symbol)
-                validation_price = self._raw_number(validation_quote.get("price"))
-                snapshot["validation_provider"] = "雪球 OpenCLI 行情兜底"
-                if validation_price is not None and snapshot["current_price"] is not None:
-                    diff = abs(snapshot["current_price"] - validation_price)
-                    pct = diff / snapshot["current_price"] if snapshot["current_price"] else 0
-                    snapshot["validation_notes"].append(
-                        f"东方财富价格={snapshot['current_price']}, 雪球价格={validation_price}, 差异={diff:.4f} ({pct:.2%})"
-                    )
-                    snapshot["validation_status"] = "cross_checked_ok" if pct <= 0.03 else "cross_checked_warning"
-                else:
-                    snapshot["validation_status"] = "cross_check_unavailable"
-                    snapshot["validation_notes"].append("无法从雪球获取可比价格，未完成双源价格校验。")
-            except Exception as validation_error:
-                snapshot["validation_status"] = "cross_check_failed"
-                snapshot["validation_notes"].append(f"双源校验失败: {validation_error}")
+            if self.enable_xueqiu_validation:
+                try:
+                    xueqiu_symbol = self.xueqiu_symbol(normalized_market, stock_input, stock_code=stock_code)
+                    validation_quote = self.fetch_xueqiu_quote(xueqiu_symbol)
+                    validation_price = self._raw_number(validation_quote.get("price"))
+                    snapshot["validation_provider"] = "雪球 OpenCLI 行情兜底"
+                    if validation_price is not None and snapshot["current_price"] is not None:
+                        diff = abs(snapshot["current_price"] - validation_price)
+                        pct = diff / snapshot["current_price"] if snapshot["current_price"] else 0
+                        snapshot["validation_notes"].append(
+                            f"东方财富价格={snapshot['current_price']}, 雪球价格={validation_price}, 差异={diff:.4f} ({pct:.2%})"
+                        )
+                        snapshot["validation_status"] = "cross_checked_ok" if pct <= 0.03 else "cross_checked_warning"
+                    else:
+                        snapshot["validation_status"] = "cross_check_unavailable"
+                        snapshot["validation_notes"].append("无法从雪球获取可比价格，未完成双源价格校验。")
+                except Exception as validation_error:
+                    snapshot["validation_status"] = "cross_check_failed"
+                    snapshot["validation_notes"].append(f"双源校验失败: {validation_error}")
+            else:
+                snapshot["validation_status"] = "single_source_backend_only"
+                snapshot["validation_notes"].append("默认使用纯后台单源快照模式，未启用雪球/OpenCLI 双源校验。")
             return snapshot
         except Exception as eastmoney_error:
+            if not self.enable_xueqiu_validation:
+                raise RuntimeError(
+                    "Failed to fetch market snapshot from Eastmoney in backend-only mode "
+                    f"(eastmoney_error={eastmoney_error})"
+                ) from eastmoney_error
             xueqiu_symbol = self.xueqiu_symbol(normalized_market, stock_input, stock_code=stock_code)
             try:
                 quote = self.fetch_xueqiu_quote(xueqiu_symbol)
