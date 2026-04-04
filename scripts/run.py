@@ -14,13 +14,15 @@ import re
 import datetime
 import time
 import subprocess
+from urllib.parse import urlsplit
 
 # --- VENV BOOTSTRAP ---
 # 彻底解决路径问题：自动寻找并使用本地虚拟环境
 script_dir = os.path.dirname(os.path.abspath(__file__))
 skill_root = os.path.dirname(script_dir)
+default_runtime_root = os.path.abspath(os.path.join(skill_root, "..", "..", ".."))
 runtime_root = os.path.abspath(
-    os.environ.get("FINANCIAL_REPORT_NOTEBOOKLM_RUNTIME_ROOT", os.getcwd())
+    os.environ.get("FINANCIAL_REPORT_NOTEBOOKLM_RUNTIME_ROOT", default_runtime_root)
 )
 SKILL_OUTPUT_ROOT = os.path.join(runtime_root, "outputs", "financial-report-to-notebooklm-skill")
 SKILL_STATE_ROOT = os.path.join(SKILL_OUTPUT_ROOT, "_state")
@@ -93,6 +95,8 @@ def looks_like_bank_name(value: str) -> bool:
 
 def read_report_excerpt(file_path: str, max_chars: int = 50000) -> str:
     """Read a short excerpt from a text-like report file for profile detection."""
+    if str(file_path).startswith(("http://", "https://")):
+        return ""
     lower_path = file_path.lower()
     if not lower_path.endswith((".md", ".txt", ".html")):
         return ""
@@ -193,6 +197,15 @@ def slugify_runtime_label(value: str) -> str:
     cleaned = re.sub(r"[^\w.-]+", "-", (value or "").strip(), flags=re.UNICODE)
     cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-._")
     return cleaned or "untitled"
+
+
+def source_entry_name(entry) -> str:
+    """Return a comparable display name for one file path or URL."""
+    text = str(entry or "").strip()
+    if text.startswith(("http://", "https://")):
+        parsed = urlsplit(text)
+        return os.path.basename(parsed.path.rstrip("/")) or parsed.netloc or text
+    return os.path.basename(text)
 
 
 def get_runtime_slug(market: str, stock_input: str) -> str:
@@ -476,11 +489,10 @@ def save_notebook_state(output_dir: str, state: dict):
 
 
 def fetch_market_snapshot(market: str, stock_input: str, stock_name: str, stock_code: str, output_dir: str) -> tuple:
-    """Fetch latest market snapshot and write a temporary markdown source."""
-    from market_data import MarketDataFetcher, snapshot_to_markdown
+    """Fetch latest market snapshot and prepare a URL-first source."""
+    from market_data import MarketDataFetcher
 
     analysis_dir = get_runtime_outputs_dir(market, stock_input)
-    analysis_snapshot_path = os.path.join(analysis_dir, "00_latest_market_snapshot.md")
     analysis_error_path = os.path.join(analysis_dir, "00_latest_market_snapshot_error.txt")
     fetcher = MarketDataFetcher()
     try:
@@ -501,22 +513,17 @@ def fetch_market_snapshot(market: str, stock_input: str, stock_name: str, stock_
             f"error={e}\n"
         )
         write_text(analysis_error_path, error_text)
-        if os.path.exists(analysis_snapshot_path):
-            os.remove(analysis_snapshot_path)
         print(f"⚠️ Failed to fetch latest market snapshot: {e}")
         print(f"📝 Saved market snapshot error log: {analysis_error_path}")
-        return None, None
+        return None, None, None
 
     fetcher.close()
-    snapshot_markdown = snapshot_to_markdown(snapshot)
-    snapshot_path = os.path.join(output_dir, "00_latest_market_snapshot.md")
-    write_text(snapshot_path, snapshot_markdown)
-    write_text(analysis_snapshot_path, snapshot_markdown)
     if os.path.exists(analysis_error_path):
         os.remove(analysis_error_path)
-    print(f"📈 Saved latest market snapshot: {snapshot_path}")
-    print(f"📈 Saved latest market snapshot output: {analysis_snapshot_path}")
-    return snapshot, snapshot_path
+    xueqiu_symbol = fetcher.xueqiu_symbol(market, stock_input, stock_code=stock_code)
+    xueqiu_url = f"https://xueqiu.com/S/{xueqiu_symbol}"
+    print(f"🔗 Prepared Xueqiu company page source: {xueqiu_url}")
+    return snapshot, None, xueqiu_url
 
 
 def summary_is_empty(summary_text: str) -> bool:
@@ -772,16 +779,58 @@ def get_missing_cn_reports(files: list, report_plan: dict) -> list:
 
 
 def dedupe_file_paths(files: list[str]) -> list[str]:
-    """Preserve order while removing duplicate absolute file paths."""
+    """Preserve order while removing duplicate file paths or URLs."""
     deduped = []
     seen = set()
     for file_path in files:
-        normalized = os.path.abspath(file_path)
+        text = str(file_path)
+        normalized = text if text.startswith(("http://", "https://")) else os.path.abspath(text)
         if normalized in seen:
             continue
         seen.add(normalized)
         deduped.append(file_path)
     return deduped
+
+
+def is_hk_report_url(value: str) -> bool:
+    """Return whether a URL points to an HKEX report-like PDF source."""
+    text = str(value or "").strip().lower()
+    return text.startswith(("http://", "https://")) and "hkexnews.hk" in text and ".pdf" in text
+
+
+def is_us_report_url(value: str) -> bool:
+    """Return whether a URL points to an SEC filing source."""
+    text = str(value or "").strip().lower()
+    return text.startswith(("http://", "https://")) and "sec.gov/archives/edgar/data/" in text
+
+
+def build_cn_report_url(announcement: dict) -> str | None:
+    """Build a direct cninfo report URL from one announcement record."""
+    adjunct_url = announcement.get("adjunctUrl")
+    if not adjunct_url:
+        return None
+    if str(adjunct_url).startswith(("http://", "https://")):
+        return str(adjunct_url)
+    return f"http://static.cninfo.com.cn/{adjunct_url}"
+
+
+def write_cn_report_link_manifest(output_dir: str, report_items: list[dict]) -> str:
+    """Write a human-readable manifest of report titles and URLs."""
+    manifest_path = os.path.join(output_dir, "00_cn_report_links.md")
+    lines = [
+        "# A股财报链接清单",
+        "",
+        "本次运行改为直接上传财报链接到 NotebookLM，不再下载 PDF 到本地。",
+        "",
+    ]
+    for item in report_items:
+        title = item.get("title") or "unknown"
+        url = item.get("url") or ""
+        lines.append(f"- {title}")
+        lines.append(f"  - {url}")
+    lines.append("")
+    write_text(manifest_path, "\n".join(lines))
+    return manifest_path
 
 
 def write_summary_input_preview(
@@ -1187,13 +1236,6 @@ def run_post_upload_analysis(
         print("   ⏭️ Skipping automated report generation because manual continuation is required.")
         return
 
-    if market_snapshot:
-        from market_data import snapshot_to_markdown
-
-        snapshot_output_path = os.path.join(analysis_dir, "00_latest_market_snapshot.md")
-        write_text(snapshot_output_path, snapshot_to_markdown(market_snapshot))
-        print(f"   📊 Saved latest market snapshot: {snapshot_output_path}")
-
     report_stage = log_stage_start("NotebookLM chat memo")
     report_prompt = build_report_prompt(
         stock_name,
@@ -1344,7 +1386,10 @@ def main():
                 notebook_report_context_ready = True
                 print("✅ Existing notebook already has the expected A-share report set.")
         elif market == "HK":
-            report_like_sources = filter_cached_files(market, notebook_source_names)
+            report_like_sources = [
+                name for name in notebook_source_names
+                if is_hk_report_url(name) or str(name).lower().endswith(".pdf")
+            ]
             recent_hk_sources, stale_hk_sources = split_recent_hk_report_entries(report_like_sources)
             if stale_hk_sources:
                 print(
@@ -1362,7 +1407,8 @@ def main():
         elif market == "US":
             report_like_sources = [
                 name for name in notebook_source_names
-                if any(marker in name.lower() for marker in ("10-k", "10-q", "20-f", "6-k", "annual", "quarter"))
+                if is_us_report_url(name)
+                or any(marker in name.lower() for marker in ("10-k", "10-q", "20-f", "6-k", "annual", "quarter"))
             ]
             recent_us_sources, stale_us_sources = split_recent_us_report_entries(report_like_sources)
             if stale_us_sources:
@@ -1447,7 +1493,7 @@ def main():
             from hk_downloader import HkexDownloader
             downloader = HkexDownloader()
             reps = downloader.find_reports(stock_input)
-            all_files = downloader.download_and_convert(reps, output_dir)
+            all_files = [item["url"] for item in reps if item.get("url")]
             stock_name = downloader.last_company_name or downloader.get_company_name(stock_input) or stock_input.zfill(5)
             stock_code = stock_input.zfill(5)
         else:
@@ -1464,10 +1510,75 @@ def main():
                     f"📅 A-share report plan ({cn_report_plan['as_of']}): "
                     f"annual={annual_years}, periodic={periodic_targets}"
                 )
-                all_files = downloader.download_annual_reports(stock_code, annual_years, output_dir)
-                periodic = downloader.download_periodic_reports(stock_code, periodic_targets, output_dir)
-                all_files.extend(periodic)
-                download_failures = getattr(downloader, "failed_reports", [])
+                report_items = []
+                for year in annual_years:
+                    search_start = f"{year + 1}-01-01"
+                    search_end = f"{year + 1}-06-30"
+                    announcements = []
+                    for searchkey in (f"{year}年年度报告", f"{year}年度报告", "年度报告"):
+                        filter_params = {
+                            "stock": [stock_code],
+                            "category": ["category_ndbg_szsh"],
+                            "searchkey": searchkey,
+                            "seDate": f"{search_start}~{search_end}",
+                        }
+                        announcements = downloader._query_announcements(filter_params)
+                        if announcements:
+                            break
+                    for ann in announcements:
+                        title = ann.get("announcementTitle", "")
+                        if downloader._is_main_annual_report(title, year):
+                            url = build_cn_report_url(ann)
+                            if url:
+                                report_items.append({"title": title, "url": url})
+                            break
+
+                periodic_config = [
+                    ("q1", "第一季度报告"),
+                    ("semi", "半年度报告"),
+                    ("q3", "第三季度报告"),
+                ]
+                for report_type, _label in periodic_config:
+                    target_year = periodic_targets.get(report_type)
+                    if not target_year:
+                        continue
+                    if report_type == "q1":
+                        search_start = f"{target_year}-01-01"
+                        search_end = f"{target_year}-06-30"
+                        searchkeys = (f"{target_year}年第一季度报告", f"{target_year}年一季度报告", "一季度报告")
+                    elif report_type == "semi":
+                        search_start = f"{target_year}-06-01"
+                        search_end = f"{target_year}-10-31"
+                        searchkeys = (f"{target_year}年半年度报告", f"{target_year}年中期报告", "半年度报告")
+                    else:
+                        search_start = f"{target_year}-09-01"
+                        search_end = f"{target_year + 1}-03-31"
+                        searchkeys = (f"{target_year}年第三季度报告", f"{target_year}年三季度报告", "三季度报告")
+                    announcements = []
+                    for searchkey in searchkeys:
+                        filter_params = {
+                            "stock": [stock_code],
+                            "category": ["category_xsjz_szsh", "category_ndbg_szsh"],
+                            "searchkey": searchkey,
+                            "seDate": f"{search_start}~{search_end}",
+                        }
+                        announcements = downloader._query_announcements(filter_params)
+                        if announcements:
+                            break
+                    for ann in announcements:
+                        title = ann.get("announcementTitle", "")
+                        if downloader._is_main_periodic_report(title, report_type):
+                            url = build_cn_report_url(ann)
+                            if url:
+                                report_items.append({"title": title, "url": url})
+                            break
+
+                all_files = [item["url"] for item in report_items if item.get("url")]
+                if all_files:
+                    manifest_path = write_cn_report_link_manifest(output_dir, report_items)
+                    all_files.append(manifest_path)
+                    print(f"🔗 Using cninfo report URLs for NotebookLM upload ({len(report_items)} reports)")
+                download_failures = []
             else:
                 print(f"❌ Stock not found: {stock_input}")
                 if not os.listdir(output_dir):
@@ -1502,7 +1613,8 @@ def main():
     snapshot_stage = log_stage_start("Market snapshot")
     market_snapshot = None
     market_snapshot_path = None
-    market_snapshot, market_snapshot_path = fetch_market_snapshot(
+    market_snapshot_url = None
+    market_snapshot, market_snapshot_path, market_snapshot_url = fetch_market_snapshot(
         market=market,
         stock_input=stock_input,
         stock_name=stock_name,
@@ -1511,6 +1623,8 @@ def main():
     )
     if market_snapshot_path:
         all_files.append(market_snapshot_path)
+    if market_snapshot_url:
+        all_files.append(market_snapshot_url)
     log_stage_end("Market snapshot", snapshot_stage)
 
     developments_stage = log_stage_start("Recent developments")
@@ -1551,11 +1665,15 @@ def main():
     from upload import (
         create_notebook,
         get_existing_source_map,
+        get_existing_source_url_map,
+        is_url_source,
         list_notebooks,
         list_sources,
         normalize_source_name,
+        normalize_source_url,
         remove_matching_sources,
         rename_notebook,
+        source_display_name,
         upload_all_sources,
         configure_notebook,
         cleanup_temp_files,
@@ -1597,8 +1715,11 @@ def main():
                 print(f"🧹 Replaced previous recent developments source(s): {len(removed_ids)}")
 
         source_map_ok, existing_source_map = get_existing_source_map(notebook_id)
+        source_url_map_ok, existing_source_url_map = get_existing_source_url_map(notebook_id)
         if not source_map_ok:
             existing_source_map = {}
+        if not source_url_map_ok:
+            existing_source_url_map = {}
         elif market.startswith("CN") and cn_report_plan:
             notebook_report_titles = []
             for sources in existing_source_map.values():
@@ -1663,19 +1784,32 @@ def main():
 
         files_to_upload = []
         for file_path in all_files:
-            normalized_name = normalize_source_name(os.path.basename(file_path))
-            is_market_snapshot = market_snapshot_path and os.path.abspath(file_path) == os.path.abspath(market_snapshot_path)
+            display_name = source_display_name(file_path)
+            normalized_name = normalize_source_name(display_name)
+            normalized_url = normalize_source_url(file_path) if is_url_source(file_path) else ""
+            is_market_snapshot = (
+                market_snapshot_path
+                and not is_url_source(file_path)
+                and os.path.abspath(file_path) == os.path.abspath(market_snapshot_path)
+            )
             is_recent_developments = (
                 include_recent_developments
                 and
                 recent_developments_path
+                and not is_url_source(file_path)
                 and os.path.abspath(file_path) == os.path.abspath(recent_developments_path)
             )
 
-            if is_market_snapshot or is_recent_developments or normalized_name not in existing_source_map:
+            already_exists = False
+            if normalized_url:
+                already_exists = normalized_url in existing_source_url_map
+            elif normalized_name:
+                already_exists = normalized_name in existing_source_map
+
+            if is_market_snapshot or is_recent_developments or not already_exists:
                 files_to_upload.append(file_path)
             else:
-                print(f"↪️ Source already exists in notebook, skipping upload: {os.path.basename(file_path)}")
+                print(f"↪️ Source already exists in notebook, skipping upload: {display_name}")
 
         upload_results = {"success": [], "failed": [], "source_ids": []}
         if files_to_upload:

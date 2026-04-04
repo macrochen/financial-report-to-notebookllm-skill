@@ -18,6 +18,7 @@ import re
 import time
 import asyncio
 import tempfile
+from urllib.parse import urlsplit, urlunsplit
 
 # Ensure virtual environment's bin is in PATH
 venv_bin = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".venv", "bin")
@@ -28,6 +29,39 @@ VENV_PYTHON = os.path.join(venv_bin, "python")
 NOTEBOOKLM_BIN = os.path.join(venv_bin, "notebooklm")
 SUMMARY_FALLBACK_TIMEOUT = 120.0
 DEFAULT_API_TIMEOUT = 120.0
+
+
+def is_url_source(value) -> bool:
+    """Return whether one source entry points to a web URL."""
+    if isinstance(value, dict):
+        value = value.get("url") or value.get("path") or value.get("title") or ""
+    text = str(value or "").strip()
+    return text.startswith("http://") or text.startswith("https://")
+
+
+def source_display_name(value) -> str:
+    """Build a short human-readable label for one source entry."""
+    if isinstance(value, dict):
+        title = (value.get("title") or "").strip()
+        if title:
+            return title
+        value = value.get("url") or value.get("path") or ""
+
+    text = str(value or "").strip()
+    if is_url_source(text):
+        parsed = urlsplit(text)
+        basename = os.path.basename(parsed.path.rstrip("/"))
+        return basename or parsed.netloc or text
+    return os.path.basename(text) or text
+
+
+def normalize_source_url(url: str) -> str:
+    """Normalize a source URL for de-duplication."""
+    parsed = urlsplit(str(url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    path = parsed.path or "/"
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.query, ""))
 
 
 def python_api_enabled() -> bool:
@@ -160,6 +194,12 @@ def extract_json_object(text: str):
 
 def normalize_source_name(name: str) -> str:
     """Normalize source title/file names for comparison."""
+    if isinstance(name, dict):
+        name = name.get("title") or name.get("url") or name.get("path") or ""
+    if is_url_source(name):
+        parsed = urlsplit(str(name).strip())
+        basename = os.path.basename(parsed.path.rstrip("/")) or parsed.netloc
+        name = basename
     if not name:
         return ""
     base = os.path.basename(name.strip()).lower()
@@ -279,25 +319,39 @@ def rename_notebook(notebook_id: str, new_title: str) -> tuple[bool, str]:
     return run_notebooklm_command(["rename", "--notebook", notebook_id, new_title])
 
 
-def upload_source(notebook_id: str, file_path: str) -> tuple[bool, str]:
-    """Upload a file as source to a notebook and return source ID when possible."""
-    filename = os.path.basename(file_path)
-    print(f"📤 Uploading: {filename}")
+def upload_source(notebook_id: str, source_input) -> tuple[bool, str]:
+    """Upload one file or URL source and return source ID when possible."""
+    is_url = is_url_source(source_input)
+    source_text = source_input.get("url") if isinstance(source_input, dict) else str(source_input)
+    display_name = source_display_name(source_input)
+    print(f"📤 Uploading: {display_name}")
 
-    staged_path, staged_dir = prepare_upload_file(file_path)
+    staged_path = None
+    staged_dir = None
+    if not is_url:
+        staged_path, staged_dir = prepare_upload_file(source_text)
     last_output = ""
     try:
         for attempt in range(1, 4):
             cli_attempted = False
             if python_api_enabled():
                 try:
-                    source = _run_api(
-                        lambda client: client.sources.add_file(
-                            notebook_id,
-                            staged_path,
-                            wait=False,
+                    if is_url:
+                        source = _run_api(
+                            lambda client: client.sources.add_url(
+                                notebook_id,
+                                source_text,
+                                wait=False,
+                            )
                         )
-                    )
+                    else:
+                        source = _run_api(
+                            lambda client: client.sources.add_file(
+                                notebook_id,
+                                staged_path,
+                                wait=False,
+                            )
+                        )
                     print(f"   ✅ Uploaded via Python API")
                     if source.id:
                         print(f"   🆔 Source ID: {source.id}")
@@ -306,9 +360,8 @@ def upload_source(notebook_id: str, file_path: str) -> tuple[bool, str]:
                     last_output = f"[python_api] {e}"
                     print(f"   ⚠️ Python API upload attempt {attempt}/3 failed", file=sys.stderr)
             if not python_api_enabled() or last_output:
-                success, output = run_notebooklm_command(
-                    ["source", "add", staged_path, "--notebook", notebook_id]
-                )
+                cli_args = ["source", "add", source_text if is_url else staged_path, "--notebook", notebook_id]
+                success, output = run_notebooklm_command(cli_args)
                 cli_attempted = True
                 last_output = output
                 if success:
@@ -331,7 +384,7 @@ def upload_source(notebook_id: str, file_path: str) -> tuple[bool, str]:
 
 
 def upload_all_sources(notebook_id: str, files: list) -> dict:
-    """Upload multiple files to a notebook"""
+    """Upload multiple file or URL sources to a notebook."""
     results = {"success": [], "failed": [], "source_ids": []}
 
     for file_path in files:
@@ -394,6 +447,21 @@ def get_existing_source_map(notebook_id: str) -> tuple[bool, dict]:
     source_map = {}
     for source in sources:
         normalized = normalize_source_name(source.get("title", ""))
+        if not normalized:
+            continue
+        source_map.setdefault(normalized, []).append(source)
+    return True, source_map
+
+
+def get_existing_source_url_map(notebook_id: str) -> tuple[bool, dict]:
+    """Build a lookup map for existing notebook sources by normalized URL."""
+    success, sources = list_sources(notebook_id)
+    if not success:
+        return False, {}
+
+    source_map = {}
+    for source in sources:
+        normalized = normalize_source_url(source.get("url", ""))
         if not normalized:
             continue
         source_map.setdefault(normalized, []).append(source)

@@ -42,8 +42,11 @@ class MarketDataFetcher:
 
     def __init__(self):
         self.skill_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        default_runtime_root = os.path.abspath(
+            os.path.join(self.skill_root, "..", "..", "..")
+        )
         self.workspace_root = os.path.abspath(
-            os.environ.get("FINANCIAL_REPORT_NOTEBOOKLM_RUNTIME_ROOT", os.getcwd())
+            os.environ.get("FINANCIAL_REPORT_NOTEBOOKLM_RUNTIME_ROOT", default_runtime_root)
         )
         self.headers = {
             "User-Agent": (
@@ -71,7 +74,7 @@ class MarketDataFetcher:
         code = (stock_code or stock_input or "").strip().upper()
 
         if normalized_market == "US":
-            return f"105.{code}"
+            return f"106.{code}"
 
         if normalized_market == "HK":
             return f"116.{code.zfill(5)}"
@@ -213,36 +216,106 @@ class MarketDataFetcher:
         return f"{prefix}{code}"
 
     def fetch_xueqiu_quote(self, symbol: str) -> dict[str, Any]:
-        """Fetch fallback quote data through the local OpenCLI Xueqiu integration."""
-        command = (
-            "source ~/.zshrc >/dev/null 2>&1; "
-            f"{os.path.join(self.workspace_root, '.gemini/skills/opencli-skill/scripts/run-opencli.sh')} "
-            f"xueqiu stock --symbol {symbol} -f json"
+        """Fetch fallback quote data from Xueqiu, preferring an existing Chrome CDP session."""
+        try:
+            return self.fetch_xueqiu_quote_cdp(symbol)
+        except Exception as cdp_error:
+            try:
+                return self.fetch_xueqiu_quote_http(symbol)
+            except Exception as http_error:
+                raise RuntimeError(
+                    "Xueqiu quote fetch failed via both CDP session and HTTP fallback "
+                    f"(cdp_error={cdp_error}; http_error={http_error})"
+                ) from http_error
+
+    def fetch_xueqiu_quote_cdp(self, symbol: str) -> dict[str, Any]:
+        """Fetch quote data through an existing Chrome session via CDP."""
+        script_path = os.path.normpath(
+            os.path.join(
+                self.skill_root,
+                "scripts",
+                "xueqiu_quote_cdp.mjs",
+            )
+        )
+        if not os.path.exists(script_path):
+            raise RuntimeError(f"CDP Xueqiu script not found: {script_path}")
+
+        result = subprocess.run(
+            ["node", script_path, symbol],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=self.workspace_root,
+        )
+        data = json.loads(result.stdout)
+        if not isinstance(data, dict) or not data:
+            raise RuntimeError(f"Empty Xueqiu CDP payload for {symbol}")
+        data["url"] = data.get("url") or f"https://xueqiu.com/S/{symbol}"
+        return data
+
+    def fetch_xueqiu_quote_http(self, symbol: str) -> dict[str, Any]:
+        """Fetch fallback quote data directly from Xueqiu's public quote endpoint."""
+        session = httpx.Client(
+            headers={
+                "User-Agent": self.headers["User-Agent"],
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": "https://xueqiu.com/",
+                "Connection": "close",
+            },
+            timeout=30.0,
+            follow_redirects=True,
         )
         last_error = None
 
-        for attempt in range(1, 3):
+        try:
+            # Prime the session cookies the same way a browser would.
+            session.get("https://xueqiu.com/")
+            session.get(f"https://xueqiu.com/S/{symbol}")
+        except Exception:
+            pass
+
+        symbol_candidates = [symbol]
+        if symbol and ":" not in symbol:
+            symbol_candidates.extend([f"US:{symbol}", f"US{symbol}"])
+
+        endpoints = [
+            "https://stock.xueqiu.com/v5/stock/quote.json",
+            "https://stock.xueqiu.com/v5/stock/batch/quote.json",
+        ]
+
+        for attempt in range(1, 4):
             try:
-                result = subprocess.run(
-                    ["/bin/zsh", "-lc", command],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    cwd=self.workspace_root,
-                )
-                data = json.loads(result.stdout)
-                if isinstance(data, list) and data:
-                    item = data[0]
-                    if item:
-                        return item
-                last_error = ValueError(f"Xueqiu returned empty data for {symbol}")
+                for endpoint in endpoints:
+                    for candidate in symbol_candidates:
+                        response = session.get(endpoint, params={"symbol": candidate, "extend": "detail"})
+                        if response.status_code == 400:
+                            last_error = ValueError(f"Xueqiu rejected symbol {candidate} at {endpoint}")
+                            continue
+                        response.raise_for_status()
+                        payload = response.json()
+                        data = payload.get("data") or {}
+                        if isinstance(data, list) and data:
+                            item = data[0] or {}
+                            if item:
+                                item["url"] = f"https://xueqiu.com/S/{symbol}"
+                                return item
+                        quote = data.get("quote") or {}
+                        market = data.get("market") or {}
+                        if quote:
+                            quote["market"] = market
+                            quote["url"] = f"https://xueqiu.com/S/{symbol}"
+                            return quote
+                        last_error = ValueError(
+                            f"Xueqiu returned empty data for {symbol} via {endpoint}"
+                        )
             except Exception as exc:
                 last_error = exc
                 self._pause_before_retry(attempt)
+        session.close()
 
         raise RuntimeError(
             "Failed to fetch Xueqiu quote "
-            f"(symbol={symbol}, source=OpenCLI xueqiu stock, last_error={last_error})"
+            f"(symbol={symbol}, source=xueqiu quote endpoint, last_error={last_error})"
         )
 
     def _scaled(self, value: Any, scale: int) -> float | None:
@@ -289,6 +362,14 @@ class MarketDataFetcher:
                 except ValueError:
                     return None
         return self._raw_number(text)
+
+    def _xueqiu_field(self, quote: dict[str, Any], *names: str) -> Any:
+        """Return the first available field from a Xueqiu quote payload."""
+        for name in names:
+            value = quote.get(name)
+            if value not in (None, "", "-"):
+                return value
+        return None
 
     def build_snapshot(self, market: str, stock_input: str, stock_name: str = None, stock_code: str = None) -> dict[str, Any]:
         """Fetch and normalize a market snapshot."""
@@ -345,7 +426,9 @@ class MarketDataFetcher:
                 try:
                     xueqiu_symbol = self.xueqiu_symbol(normalized_market, stock_input, stock_code=stock_code)
                     validation_quote = self.fetch_xueqiu_quote(xueqiu_symbol)
-                    validation_price = self._raw_number(validation_quote.get("price"))
+                    validation_price = self._raw_number(
+                        self._xueqiu_field(validation_quote, "current", "price", "current_ext")
+                    )
                     snapshot["validation_provider"] = "雪球 OpenCLI 行情兜底"
                     if validation_price is not None and snapshot["current_price"] is not None:
                         diff = abs(snapshot["current_price"] - validation_price)
@@ -365,18 +448,39 @@ class MarketDataFetcher:
                 snapshot["validation_notes"].append("默认使用纯后台单源快照模式，未启用雪球/OpenCLI 双源校验。")
             return snapshot
         except Exception as eastmoney_error:
-            if not self.enable_xueqiu_validation:
-                raise RuntimeError(
-                    "Failed to fetch market snapshot from Eastmoney in backend-only mode "
-                    f"(eastmoney_error={eastmoney_error})"
-                ) from eastmoney_error
             xueqiu_symbol = self.xueqiu_symbol(normalized_market, stock_input, stock_code=stock_code)
             try:
                 quote = self.fetch_xueqiu_quote(xueqiu_symbol)
-                current_price = self._raw_number(quote.get("price"))
-                market_cap = self._chinese_amount_to_number(quote.get("marketCap"))
-                shares_outstanding = None
-                if current_price and market_cap:
+                current_price = self._raw_number(
+                    self._xueqiu_field(quote, "current", "price", "current_ext")
+                )
+                market_cap = self._chinese_amount_to_number(
+                    self._xueqiu_field(quote, "market_capital", "marketCap")
+                )
+                float_market_cap = self._chinese_amount_to_number(
+                    self._xueqiu_field(quote, "float_market_capital")
+                )
+                shares_outstanding = self._raw_number(
+                    self._xueqiu_field(quote, "total_shares", "shares_outstanding")
+                )
+                float_shares = self._raw_number(self._xueqiu_field(quote, "float_shares"))
+                previous_close = self._raw_number(
+                    self._xueqiu_field(quote, "last_close", "previous_close")
+                )
+                open_price = self._raw_number(self._xueqiu_field(quote, "open"))
+                day_high = self._raw_number(self._xueqiu_field(quote, "high"))
+                day_low = self._raw_number(self._xueqiu_field(quote, "low"))
+                price_change = self._raw_number(self._xueqiu_field(quote, "chg", "price_change"))
+                price_change_percent = self._raw_number(
+                    self._xueqiu_field(quote, "percent", "changePercent", "percent_ext")
+                )
+                volume = self._raw_number(self._xueqiu_field(quote, "volume"))
+                turnover = self._raw_number(self._xueqiu_field(quote, "amount", "turnover"))
+                turnover_rate = self._raw_number(self._xueqiu_field(quote, "turnover_rate"))
+                trailing_pe = self._raw_number(self._xueqiu_field(quote, "pe_ttm", "pettm"))
+                price_to_book = self._raw_number(self._xueqiu_field(quote, "pb", "pb_mrq"))
+
+                if shares_outstanding is None and current_price and market_cap:
                     shares_outstanding = market_cap / current_price
 
                 return {
@@ -388,32 +492,32 @@ class MarketDataFetcher:
                     "input": stock_input,
                     "stock_code": stock_code or stock_input,
                     "stock_name": stock_name or quote.get("name") or stock_input,
-                    "exchange": quote.get("symbol"),
+                    "exchange": self._xueqiu_field(quote, "exchange", "symbol"),
                     "currency": self.currency_for_market(normalized_market),
                     "current_price": current_price,
-                    "price_change": None,
-                    "price_change_percent": self._percent_to_number(quote.get("changePercent")),
-                    "previous_close": None,
-                    "open": None,
-                    "day_high": None,
-                    "day_low": None,
+                    "price_change": price_change,
+                    "price_change_percent": price_change_percent,
+                    "previous_close": previous_close,
+                    "open": open_price,
+                    "day_high": day_high,
+                    "day_low": day_low,
                     "amplitude_percent": None,
                     "market_cap": market_cap,
-                    "float_market_cap": None,
+                    "float_market_cap": float_market_cap,
                     "shares_outstanding": shares_outstanding,
-                    "float_shares": None,
-                    "volume": None,
-                    "turnover": None,
-                    "turnover_rate": None,
-                    "trailing_pe": None,
-                    "price_to_book": None,
+                    "float_shares": float_shares,
+                    "volume": volume,
+                    "turnover": turnover,
+                    "turnover_rate": turnover_rate,
+                    "trailing_pe": trailing_pe,
+                    "price_to_book": price_to_book,
                     "eastmoney_secid": secid,
-                    "source_name": "雪球 OpenCLI 行情兜底",
+                    "source_name": "雪球已登录会话行情兜底",
                     "source_url": quote.get("url") or f"https://xueqiu.com/S/{xueqiu_symbol}",
                     "market_timezone": self.market_timezone(normalized_market),
                     "market_session_hint": self.market_session_label(normalized_market, generated_at),
                     "freshness_note": "运行时抓取；若处于非交易时段，则通常更接近最近收盘/最近成交口径。",
-                    "validation_provider": None,
+                    "validation_provider": "雪球 OpenCLI 行情兜底",
                     "validation_status": "single_source_fallback",
                     "validation_notes": [f"东方财富抓取失败，已切换雪球兜底: {eastmoney_error}"],
                 }

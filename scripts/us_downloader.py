@@ -21,6 +21,10 @@ class SecEdgarDownloader:
         # Increased timeout and added HTTP2 support for better performance
         self.client = httpx.Client(timeout=60.0, follow_redirects=True, http2=True)
         self._ticker_mapping = None
+        self.url_source_mode = os.environ.get(
+            "FINANCIAL_REPORT_NOTEBOOKLM_US_URL_SOURCE_MODE",
+            "1",
+        ).strip().lower() not in {"0", "false", "no", "off"}
 
     def _load_ticker_mapping(self):
         """Load and cache the official SEC ticker mapping."""
@@ -109,6 +113,11 @@ class SecEdgarDownloader:
             print(f"❌ SEC Download error: {e}")
         return None
 
+    def get_filing_url(self, cik: str, accession_number: str, primary_document: str) -> str:
+        """Build one SEC filing URL."""
+        acc_no_clean = accession_number.replace("-", "")
+        return f"https://www.sec.gov/Archives/edgar/data/{cik.lstrip('0')}/{acc_no_clean}/{primary_document}"
+
     def get_reports(self, ticker: str, output_dir: str) -> list:
         cik = self.get_cik(ticker)
         if not cik: return []
@@ -132,7 +141,9 @@ class SecEdgarDownloader:
             # Support both US (10-K/Q) and Foreign (20-F/6-K) issuers
             if form in ["10-K", "20-F"] and ten_k_count < 5:
                 label = "10K" if form == "10-K" else "20F"
-                res = self.download_filing(cik, acc_nos[i], docs[i], output_dir, f"{ticker}_{label}_{dates[i]}")
+                title = f"{ticker}_{label}_{dates[i]}"
+                filing_url = self.get_filing_url(cik, acc_nos[i], docs[i])
+                res = filing_url if self.url_source_mode else self.download_filing(cik, acc_nos[i], docs[i], output_dir, title)
                 if res:
                     results.append(res)
                     ten_k_count += 1
@@ -140,11 +151,13 @@ class SecEdgarDownloader:
                 # For 6-K, we take the last 3 because they often contain quarterly results
                 # instead of just picking one.
                 label = "10Q" if form == "10-Q" else "6K"
+                filing_url = self.get_filing_url(cik, acc_nos[i], docs[i])
                 # Avoid duplicates for same date
-                if any(f"{ticker}_{label}_{dates[i]}" in f for f in results):
+                if filing_url in results or any(f"{ticker}_{label}_{dates[i]}" in f for f in results):
                     continue
                     
-                res = self.download_filing(cik, acc_nos[i], docs[i], output_dir, f"{ticker}_{label}_{dates[i]}")
+                title = f"{ticker}_{label}_{dates[i]}"
+                res = filing_url if self.url_source_mode else self.download_filing(cik, acc_nos[i], docs[i], output_dir, title)
                 if res:
                     results.append(res)
                     if label == "10Q": six_k_count += 3 # Found a proper 10-Q, stop looking for 10Q
